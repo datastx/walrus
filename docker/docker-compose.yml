@@ -1,0 +1,81 @@
+services:
+  source-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: sourcedb
+      POSTGRES_USER: replicator
+      POSTGRES_PASSWORD: replpass
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+      - -c
+      - wal_keep_size=1GB
+    ports:
+      - "5432:5432"
+    volumes:
+      - source-pgdata:/var/lib/postgresql/data
+      - ../scripts/setup_source_db.sql:/docker-entrypoint-initdb.d/01-setup.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U replicator -d sourcedb"]
+      interval: 5s
+      retries: 10
+
+  wal-capture:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: wal-capture
+    environment:
+      PG_HOST: source-postgres
+      PG_PORT: "5432"
+      PG_DATABASE: sourcedb
+      PG_USER: replicator
+      PG_PASSWORD: replpass
+      STAGING_ROOT: /data/staging
+      RUST_LOG: info,pgiceberg=debug
+    volumes:
+      - staging-data:/data/staging
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  iceberg-writer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      target: iceberg-writer
+    environment:
+      PG_HOST: source-postgres
+      PG_PORT: "5432"
+      PG_DATABASE: sourcedb
+      PG_USER: replicator
+      PG_PASSWORD: replpass
+      STAGING_ROOT: /data/staging
+      WAREHOUSE_PATH: /data/iceberg
+      RUST_LOG: info,pgiceberg=debug
+    volumes:
+      - staging-data:/data/staging:ro
+      - warehouse-data:/data/iceberg
+    depends_on:
+      source-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  duckdb-cli:
+    image: ubuntu:22.04
+    volumes:
+      - warehouse-data:/data/iceberg:ro
+    entrypoint: ["tail", "-f", "/dev/null"]
+    profiles:
+      - debug
+
+volumes:
+  source-pgdata:
+  staging-data:
+  warehouse-data:
