@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod common;
 
 /// Placeholder for crash recovery integration tests.

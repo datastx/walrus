@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod common;
 
 // DDL integration tests are placeholders.

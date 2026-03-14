@@ -1,4 +1,6 @@
-use pgiceberg_common::config::{AppConfig, IcebergWriterConfig, SourceConfig, StagingConfig, WalCaptureConfig};
+use pgiceberg_common::config::{
+    AppConfig, IcebergWriterConfig, SourceConfig, StagingConfig, WalCaptureConfig,
+};
 use pgiceberg_common::metadata::MetadataStore;
 use std::path::PathBuf;
 
@@ -22,8 +24,14 @@ pub fn test_config() -> AppConfig {
             database,
             user,
             password_env: "PG_PASSWORD".to_string(),
-            slot_name: format!("test_slot_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string()),
-            publication_name: format!("test_pub_{}", uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string()),
+            slot_name: format!(
+                "test_slot_{}",
+                uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string()
+            ),
+            publication_name: format!(
+                "test_pub_{}",
+                uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string()
+            ),
             tables: std::collections::HashMap::new(),
         },
         staging: StagingConfig {
@@ -50,12 +58,14 @@ pub async fn connect_metadata(config: &AppConfig) -> anyhow::Result<MetadataStor
 /// Clean up test artifacts.
 pub async fn cleanup(config: &AppConfig) {
     let conn_str = config.source.connection_string();
-    if let Ok(meta) = MetadataStore::connect(&conn_str).await {
+    if let Ok(_meta) = MetadataStore::connect(&conn_str).await {
         let client = tokio_postgres::connect(&conn_str, tokio_postgres::NoTls)
             .await
             .ok();
         if let Some((client, conn)) = client {
-            tokio::spawn(async move { conn.await.ok(); });
+            tokio::spawn(async move {
+                conn.await.ok();
+            });
 
             // Drop slot if it exists
             client
@@ -72,7 +82,10 @@ pub async fn cleanup(config: &AppConfig) {
             // Drop publication
             client
                 .execute(
-                    &format!("DROP PUBLICATION IF EXISTS {}", config.source.publication_name),
+                    &format!(
+                        "DROP PUBLICATION IF EXISTS {}",
+                        config.source.publication_name
+                    ),
                     &[],
                 )
                 .await

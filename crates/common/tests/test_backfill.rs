@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 mod common;
 
 // Integration tests below require a running Postgres with wal_level=logical.
