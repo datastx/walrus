@@ -69,6 +69,7 @@ impl SpillFile {
         }
     }
 
+    #[cfg(test)]
     pub fn record_count(&self) -> usize {
         self.record_count
     }

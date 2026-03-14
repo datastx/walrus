@@ -73,7 +73,8 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
-    clippy::multiple_crate_versions
+    clippy::multiple_crate_versions,
+    clippy::cargo_common_metadata
 )]
 
 pub mod auth;
