@@ -540,6 +540,23 @@ impl MetadataStore {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
+    // ── heartbeat ─────────────────────────────────────────────────
+
+    /// Emit a lightweight transactional logical message into WAL.
+    /// This generates a Begin/Message/Commit sequence that flows through the
+    /// replication slot, allowing the consumer to advance the confirmed LSN
+    /// and PostgreSQL to reclaim old WAL segments.
+    pub async fn tick_heartbeat(&self) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "SELECT pg_logical_emit_message(true, 'walrus_heartbeat', 'tick')",
+                &[],
+            )
+            .await?;
+        Ok(())
+    }
+
     // ── ddl_events ────────────────────────────────────────────────
 
     pub async fn insert_ddl_event(

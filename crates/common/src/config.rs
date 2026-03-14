@@ -125,6 +125,13 @@ pub struct WalCaptureConfig {
     #[serde(default)]
     pub streaming: bool,
 
+    /// Heartbeat interval in seconds for advancing the replication slot during
+    /// idle periods. Uses `pg_logical_emit_message()` to generate lightweight
+    /// WAL entries that flow through the slot, allowing PostgreSQL to reclaim
+    /// old WAL segments. Set to 0 to disable. Default: 300 (5 minutes).
+    #[serde(default = "default_heartbeat_interval_seconds")]
+    pub heartbeat_interval_seconds: u64,
+
     #[serde(default = "default_health_port_capture")]
     pub health_port: u16,
 }
@@ -278,6 +285,11 @@ impl AppConfig {
                 config.wal_capture.max_txn_memory_bytes = n;
             }
         }
+        if let Ok(v) = std::env::var("HEARTBEAT_INTERVAL_SECONDS") {
+            if let Ok(n) = v.parse() {
+                config.wal_capture.heartbeat_interval_seconds = n;
+            }
+        }
         if let Ok(v) = std::env::var("CDC_STREAMING") {
             config.wal_capture.streaming = matches!(v.to_lowercase().as_str(), "true" | "1" | "on");
         }
@@ -327,6 +339,7 @@ impl Default for WalCaptureConfig {
             idle_timeout_seconds: default_idle_timeout_seconds(),
             max_txn_memory_bytes: default_max_txn_memory_bytes(),
             streaming: false,
+            heartbeat_interval_seconds: default_heartbeat_interval_seconds(),
             health_port: default_health_port_capture(),
         }
     }
@@ -397,6 +410,9 @@ fn default_max_retries() -> i32 {
 }
 fn default_max_txn_memory_bytes() -> usize {
     128 * 1024 * 1024 // 128 MB
+}
+fn default_heartbeat_interval_seconds() -> u64 {
+    300
 }
 fn default_health_port_capture() -> u16 {
     8081
