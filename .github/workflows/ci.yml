@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --lib
+
+  test-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: replicator
+          POSTGRES_PASSWORD: testpass
+        options: >-
+          --health-cmd "pg_isready -U replicator -d testdb"
+          --health-interval 5s
+          --health-retries 10
+        ports:
+          - 5433:5432
+    env:
+      TEST_PG_HOST: localhost
+      TEST_PG_PORT: "5433"
+      TEST_PG_DATABASE: testdb
+      TEST_PG_USER: replicator
+      TEST_PG_PASSWORD: testpass
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure Postgres for logical replication
+        run: |
+          PGPASSWORD=testpass psql -h localhost -p 5433 -U replicator -d testdb \
+            -c "ALTER SYSTEM SET wal_level = logical;" \
+            -c "ALTER SYSTEM SET max_replication_slots = 10;" \
+            -c "ALTER SYSTEM SET max_wal_senders = 10;"
+          docker restart $(docker ps -q --filter "ancestor=postgres:16")
+          sleep 5
+      - run: cargo test --workspace --test '*' -- --test-threads=1
