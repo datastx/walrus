@@ -5,7 +5,9 @@ use uuid::Uuid;
 
 /// Postgres LSN represented as a u64 for arithmetic.
 /// Display and parse use the standard `X/Y` hex format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
+)]
 pub struct Lsn(pub u64);
 
 impl Lsn {
@@ -182,7 +184,7 @@ pub struct DdlEvent {
 }
 
 /// A single CDC record decoded from WAL.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CdcRecord {
     pub table_schema: String,
     pub table_name: String,
@@ -196,7 +198,7 @@ pub struct CdcRecord {
     pub seq: i64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CdcOp {
     Insert,
     Update,
@@ -213,7 +215,7 @@ impl CdcOp {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CdcColumn {
     pub name: String,
     pub type_oid: u32,
