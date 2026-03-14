@@ -41,12 +41,17 @@ impl TablePhase {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
-        match s {
+}
+
+impl std::str::FromStr for TablePhase {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "backfilling" => TablePhase::Backfilling,
             "streaming" => TablePhase::Streaming,
             _ => TablePhase::Pending,
-        }
+        })
     }
 }
 
@@ -70,14 +75,19 @@ impl FileStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
-        match s {
+}
+
+impl std::str::FromStr for FileStatus {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "processing" => FileStatus::Processing,
             "completed" => FileStatus::Completed,
             "deleted" => FileStatus::Deleted,
             "failed" => FileStatus::Failed,
             _ => FileStatus::Pending,
-        }
+        })
     }
 }
 
@@ -240,7 +250,7 @@ mod tests {
             TablePhase::Backfilling,
             TablePhase::Streaming,
         ] {
-            assert_eq!(TablePhase::from_str(phase.as_str()), phase);
+            assert_eq!(phase.as_str().parse::<TablePhase>().unwrap(), phase);
         }
     }
 

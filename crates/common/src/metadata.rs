@@ -141,7 +141,7 @@ impl MetadataStore {
         Ok(row.map(|r| TableState {
             table_schema: r.get(0),
             table_name: r.get(1),
-            phase: TablePhase::from_str(r.get(2)),
+            phase: r.get::<_, String>(2).parse().unwrap(),
             backfill_total_partitions: r.get(3),
             backfill_done_partitions: r.get(4),
             backfill_snapshot_name: r.get(5),
@@ -170,7 +170,7 @@ impl MetadataStore {
             .map(|r| TableState {
                 table_schema: r.get(0),
                 table_name: r.get(1),
-                phase: TablePhase::from_str(r.get(2)),
+                phase: r.get::<_, String>(2).parse().unwrap(),
                 backfill_total_partitions: r.get(3),
                 backfill_done_partitions: r.get(4),
                 backfill_snapshot_name: r.get(5),
@@ -255,6 +255,7 @@ impl MetadataStore {
 
     // ── file_queue ────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_file(
         &self,
         schema: &str,
@@ -292,6 +293,7 @@ impl MetadataStore {
     }
 
     /// Atomically enqueue a CDC file AND update the flushed LSN in one transaction.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_cdc_file_and_update_lsn(
         &self,
         slot_name: &str,
@@ -558,7 +560,7 @@ impl MetadataStore {
                 .and_then(|s| Lsn::parse(&s).ok()),
             row_count: r.get(7),
             partition_id: r.get(8),
-            status: FileStatus::from_str(r.get(9)),
+            status: r.get::<_, String>(9).parse().unwrap(),
             created_at: r.get(10),
             retry_count: r.get(11),
             error_message: r.get(12),
