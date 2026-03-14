@@ -1,7 +1,7 @@
 use crate::decoder::*;
 use crate::parquet_writer::write_cdc_records_to_parquet;
-use pgiceberg_common::config::WalCaptureConfig;
-use pgiceberg_common::metadata::MetadataStore;
+use pgiceberg_common::config::{SourceConfig, WalCaptureConfig};
+use pgiceberg_common::metadata::{EnqueueCdcFileParams, MetadataStore};
 use pgiceberg_common::models::*;
 use std::collections::HashMap;
 use std::path::Path;
@@ -10,6 +10,14 @@ use tokio::sync::watch;
 use uuid::Uuid;
 
 use pgwire_replication::{ReplicationClient, ReplicationConfig, ReplicationEvent, TlsConfig};
+
+pub struct CdcLoopParams<'a> {
+    pub source: &'a SourceConfig,
+    pub start_lsn: Lsn,
+    pub config: &'a WalCaptureConfig,
+    pub metadata: &'a MetadataStore,
+    pub staging_root: &'a Path,
+}
 
 /// Per-table buffer of CDC records waiting to be flushed.
 struct TableBuffer {
@@ -52,6 +60,147 @@ impl TableBuffer {
     }
 }
 
+struct TxnState {
+    xid: u32,
+    records: Vec<CdcRecord>,
+}
+
+struct CdcState<'a> {
+    relation_cache: RelationCache,
+    table_buffers: HashMap<String, TableBuffer>,
+    current_txn: Option<TxnState>,
+    last_flush: Instant,
+    total_buffered_rows: usize,
+    total_buffered_bytes: usize,
+    metadata: &'a MetadataStore,
+    slot_name: &'a str,
+    staging_root: &'a Path,
+    config: &'a WalCaptureConfig,
+}
+
+impl<'a> CdcState<'a> {
+    fn new(
+        metadata: &'a MetadataStore,
+        slot_name: &'a str,
+        staging_root: &'a Path,
+        config: &'a WalCaptureConfig,
+    ) -> Self {
+        Self {
+            relation_cache: RelationCache::new(),
+            table_buffers: HashMap::new(),
+            current_txn: None,
+            last_flush: Instant::now(),
+            total_buffered_rows: 0,
+            total_buffered_bytes: 0,
+            metadata,
+            slot_name,
+            staging_root,
+            config,
+        }
+    }
+
+    fn handle_begin(&mut self, xid: u32) {
+        self.current_txn = Some(TxnState {
+            xid,
+            records: Vec::new(),
+        });
+    }
+
+    fn handle_commit(&mut self, end_lsn: Lsn, commit_ts: i64) {
+        if let Some(txn) = self.current_txn.take() {
+            tracing::trace!(xid = txn.xid, records = txn.records.len(), "Commit");
+            for mut record in txn.records {
+                record.commit_lsn = end_lsn;
+                record.commit_ts = commit_ts;
+                let key = format!("{}.{}", record.table_schema, record.table_name);
+                self.total_buffered_rows += 1;
+                self.total_buffered_bytes += record.estimated_bytes;
+                self.table_buffers
+                    .entry(key)
+                    .or_insert_with(TableBuffer::new)
+                    .push(record);
+            }
+        }
+    }
+
+    fn handle_relation(
+        &mut self,
+        oid: u32,
+        schema: String,
+        name: String,
+        columns: Vec<RelationColumn>,
+    ) {
+        self.relation_cache.update(oid, schema, name, columns);
+    }
+
+    async fn handle_insert(&mut self, relation_oid: u32, tuple: &TupleData) -> anyhow::Result<()> {
+        let Some(ref mut txn) = self.current_txn else {
+            return Ok(());
+        };
+        let Some(rel) = self.relation_cache.get(relation_oid) else {
+            return Ok(());
+        };
+        if rel.name == "awsdms_ddl_audit" {
+            handle_ddl_insert(tuple, rel, self.metadata).await?;
+        } else {
+            let record = tuple_to_cdc_record(rel, CdcOp::Insert, tuple, Lsn::ZERO, 0);
+            txn.records.push(record);
+        }
+        Ok(())
+    }
+
+    fn handle_update(&mut self, relation_oid: u32, new_tuple: &TupleData) {
+        let Some(ref mut txn) = self.current_txn else {
+            return;
+        };
+        let Some(rel) = self.relation_cache.get(relation_oid) else {
+            return;
+        };
+        let record = tuple_to_cdc_record(rel, CdcOp::Update, new_tuple, Lsn::ZERO, 0);
+        txn.records.push(record);
+    }
+
+    fn handle_delete(&mut self, relation_oid: u32, old_tuple: &TupleData) {
+        let Some(ref mut txn) = self.current_txn else {
+            return;
+        };
+        let Some(rel) = self.relation_cache.get(relation_oid) else {
+            return;
+        };
+        let record = tuple_to_cdc_record(rel, CdcOp::Delete, old_tuple, Lsn::ZERO, 0);
+        txn.records.push(record);
+    }
+
+    fn should_flush(&self) -> bool {
+        let rows = self.config.max_batch_rows > 0
+            && self.total_buffered_rows >= self.config.max_batch_rows;
+        let bytes = self.config.max_batch_bytes > 0
+            && self.total_buffered_bytes >= self.config.max_batch_bytes;
+        rows || bytes
+    }
+
+    fn should_flush_timer(&self) -> bool {
+        self.config.flush_interval_seconds > 0
+            && self.last_flush.elapsed().as_secs() >= self.config.flush_interval_seconds
+            && !self.table_buffers.values().all(|b| b.is_empty())
+    }
+
+    async fn flush(&mut self) -> anyhow::Result<()> {
+        flush_all_buffers(
+            &mut self.table_buffers,
+            &self.relation_cache,
+            self.metadata,
+            self.slot_name,
+            self.staging_root,
+        )
+        .await?;
+        self.total_buffered_rows = 0;
+        self.total_buffered_bytes = 0;
+        self.last_flush = Instant::now();
+        Ok(())
+    }
+}
+
 /// Runs the CDC streaming loop.
 ///
 /// Starts reading WAL immediately from the replication slot's consistent_point.
@@ -67,37 +216,30 @@ impl TableBuffer {
 /// Recovery: on restart, reads `last_flushed_lsn` from metadata and resumes
 /// from there.  Any duplicate WAL re-reads produce idempotent results because
 /// Service 2 deduplicates on PK.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_cdc_loop(
-    source_host: &str,
-    source_port: u16,
-    source_user: &str,
-    source_password: &str,
-    source_database: &str,
-    slot_name: &str,
-    publication_name: &str,
-    start_lsn: Lsn,
-    config: &WalCaptureConfig,
-    metadata: &MetadataStore,
-    staging_root: &Path,
+    params: &CdcLoopParams<'_>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    let source = params.source;
+    let start_lsn = params.start_lsn;
+    let slot_name = &source.slot_name;
+
     let repl_lsn = pgwire_replication::Lsn::parse(&start_lsn.to_string())
         .map_err(|e| anyhow::anyhow!("Invalid start LSN: {}", e))?;
 
     let repl_config = ReplicationConfig {
-        host: source_host.into(),
-        port: source_port,
-        user: source_user.into(),
-        password: source_password.into(),
-        database: source_database.into(),
+        host: source.host.clone(),
+        port: source.port,
+        user: source.user.clone(),
+        password: source.password(),
+        database: source.database.clone(),
         tls: TlsConfig::disabled(),
-        slot: slot_name.into(),
-        publication: publication_name.into(),
+        slot: source.slot_name.clone(),
+        publication: source.publication_name.clone(),
         start_lsn: repl_lsn,
         stop_at_lsn: None,
-        status_interval: std::time::Duration::from_secs(config.idle_timeout_seconds),
-        idle_wakeup_interval: std::time::Duration::from_secs(config.idle_timeout_seconds),
+        status_interval: std::time::Duration::from_secs(params.config.idle_timeout_seconds),
+        idle_wakeup_interval: std::time::Duration::from_secs(params.config.idle_timeout_seconds),
         buffer_events: 8192,
     };
 
@@ -108,46 +250,23 @@ pub async fn run_cdc_loop(
     );
 
     let mut client = ReplicationClient::connect(repl_config).await?;
-    let mut relation_cache = RelationCache::new();
-    let mut table_buffers: HashMap<String, TableBuffer> = HashMap::new();
-    let mut current_txn: Option<TxnState> = None;
-    let mut last_flush = Instant::now();
-    let mut total_buffered_rows = 0usize;
-    let mut total_buffered_bytes = 0usize;
+    let mut state = CdcState::new(
+        params.metadata,
+        slot_name,
+        params.staging_root,
+        params.config,
+    );
 
     loop {
-        // Check shutdown signal
         if *shutdown_rx.borrow() {
             tracing::info!("Shutdown signal received — flushing remaining buffers");
-            flush_all_buffers(
-                &mut table_buffers,
-                &relation_cache,
-                metadata,
-                slot_name,
-                staging_root,
-            )
-            .await?;
+            state.flush().await?;
             client.stop();
             break;
         }
 
-        // Check time-based flush
-        let elapsed = last_flush.elapsed().as_secs();
-        if config.flush_interval_seconds > 0
-            && elapsed >= config.flush_interval_seconds
-            && !all_empty(&table_buffers)
-        {
-            flush_all_buffers(
-                &mut table_buffers,
-                &relation_cache,
-                metadata,
-                slot_name,
-                staging_root,
-            )
-            .await?;
-            total_buffered_rows = 0;
-            total_buffered_bytes = 0;
-            last_flush = Instant::now();
+        if state.should_flush_timer() {
+            state.flush().await?;
         }
 
         let event = tokio::select! {
@@ -160,34 +279,11 @@ pub async fn run_cdc_loop(
                 let msg = decode_pgoutput(&data)?;
 
                 match msg {
-                    PgOutputMessage::Begin {
-                        final_lsn,
-                        commit_ts,
-                        xid,
-                    } => {
-                        current_txn = Some(TxnState {
-                            xid,
-                            commit_lsn: final_lsn,
-                            commit_ts,
-                            records: Vec::new(),
-                        });
-                    }
+                    PgOutputMessage::Begin { xid, .. } => state.handle_begin(xid),
                     PgOutputMessage::Commit {
                         end_lsn, commit_ts, ..
                     } => {
-                        if let Some(txn) = current_txn.take() {
-                            for mut record in txn.records {
-                                record.commit_lsn = end_lsn;
-                                record.commit_ts = commit_ts;
-                                let key = format!("{}.{}", record.table_schema, record.table_name);
-                                total_buffered_rows += 1;
-                                total_buffered_bytes += record.estimated_bytes;
-                                table_buffers
-                                    .entry(key)
-                                    .or_insert_with(TableBuffer::new)
-                                    .push(record);
-                            }
-                        }
+                        state.handle_commit(end_lsn, commit_ts);
                         client.update_applied_lsn(
                             pgwire_replication::Lsn::parse(&Lsn(wal_end.into()).to_string())
                                 .unwrap_or(repl_lsn),
@@ -199,105 +295,38 @@ pub async fn run_cdc_loop(
                         name,
                         columns,
                         ..
-                    } => {
-                        // Check if this is the DDL audit table
-                        relation_cache.update(oid, schema, name, columns);
-                    }
+                    } => state.handle_relation(oid, schema, name, columns),
                     PgOutputMessage::Insert {
                         relation_oid,
                         tuple,
-                    } => {
-                        if let Some(ref mut txn) = current_txn {
-                            if let Some(rel) = relation_cache.get(relation_oid) {
-                                if rel.name == "awsdms_ddl_audit" {
-                                    handle_ddl_insert(&tuple, rel, metadata).await?;
-                                } else {
-                                    let record = tuple_to_cdc_record(
-                                        rel,
-                                        CdcOp::Insert,
-                                        &tuple,
-                                        Lsn::ZERO,
-                                        0,
-                                    );
-                                    txn.records.push(record);
-                                }
-                            }
-                        }
-                    }
+                    } => state.handle_insert(relation_oid, &tuple).await?,
                     PgOutputMessage::Update {
                         relation_oid,
                         new_tuple,
                         ..
-                    } => {
-                        if let Some(ref mut txn) = current_txn {
-                            if let Some(rel) = relation_cache.get(relation_oid) {
-                                let record = tuple_to_cdc_record(
-                                    rel,
-                                    CdcOp::Update,
-                                    &new_tuple,
-                                    Lsn::ZERO,
-                                    0,
-                                );
-                                txn.records.push(record);
-                            }
-                        }
-                    }
+                    } => state.handle_update(relation_oid, &new_tuple),
                     PgOutputMessage::Delete {
                         relation_oid,
                         old_tuple,
-                    } => {
-                        if let Some(ref mut txn) = current_txn {
-                            if let Some(rel) = relation_cache.get(relation_oid) {
-                                let record = tuple_to_cdc_record(
-                                    rel,
-                                    CdcOp::Delete,
-                                    &old_tuple,
-                                    Lsn::ZERO,
-                                    0,
-                                );
-                                txn.records.push(record);
-                            }
-                        }
-                    }
+                    } => state.handle_delete(relation_oid, &old_tuple),
                     _ => {}
                 }
 
-                // Check row/byte flush thresholds
-                let should_flush_rows =
-                    config.max_batch_rows > 0 && total_buffered_rows >= config.max_batch_rows;
-                let should_flush_bytes =
-                    config.max_batch_bytes > 0 && total_buffered_bytes >= config.max_batch_bytes;
-
-                if should_flush_rows || should_flush_bytes {
+                if state.should_flush() {
                     tracing::debug!(
-                        rows = total_buffered_rows,
-                        bytes = total_buffered_bytes,
-                        trigger = if should_flush_rows { "rows" } else { "bytes" },
+                        rows = state.total_buffered_rows,
+                        bytes = state.total_buffered_bytes,
                         "Flush threshold reached"
                     );
-                    flush_all_buffers(
-                        &mut table_buffers,
-                        &relation_cache,
-                        metadata,
-                        slot_name,
-                        staging_root,
-                    )
-                    .await?;
-                    total_buffered_rows = 0;
-                    total_buffered_bytes = 0;
-                    last_flush = Instant::now();
+                    state.flush().await?;
                 }
             }
-            Ok(Some(ReplicationEvent::KeepAlive { .. })) => {
-                // Nothing to do — pgwire-replication handles standby status
-            }
+            Ok(Some(ReplicationEvent::KeepAlive { .. })) => {}
             Ok(Some(ReplicationEvent::StoppedAt { .. })) => {
                 tracing::info!("Replication stream ended");
                 break;
             }
-            Ok(Some(_)) => {
-                // Begin, Commit, Message — handled internally by pgwire-replication
-            }
+            Ok(Some(_)) => {}
             Ok(None) => {
                 tracing::info!("Replication stream closed");
                 break;
@@ -312,16 +341,6 @@ pub async fn run_cdc_loop(
     Ok(())
 }
 
-struct TxnState {
-    #[allow(dead_code)]
-    xid: u32,
-    #[allow(dead_code)]
-    commit_lsn: Lsn,
-    #[allow(dead_code)]
-    commit_ts: i64,
-    records: Vec<CdcRecord>,
-}
-
 fn tuple_to_cdc_record(
     rel: &CachedRelation,
     op: CdcOp,
@@ -329,7 +348,7 @@ fn tuple_to_cdc_record(
     commit_lsn: Lsn,
     commit_ts: i64,
 ) -> CdcRecord {
-    let mut estimated_bytes = 64; // base overhead
+    let mut estimated_bytes = 64;
     let columns: Vec<CdcColumn> = rel
         .columns
         .iter()
@@ -370,7 +389,6 @@ async fn handle_ddl_insert(
     _rel: &CachedRelation,
     metadata: &MetadataStore,
 ) -> anyhow::Result<()> {
-    // DDL audit table columns: c_key, c_time, c_user, c_txn, c_tag, c_oid, c_name, c_schema, c_ddlqry
     let get_text = |idx: usize| -> Option<String> {
         tuple.columns.get(idx).and_then(|c| match c {
             TupleColumn::Text(data) => String::from_utf8(data.clone()).ok(),
@@ -412,31 +430,34 @@ async fn flush_all_buffers(
             ("public", parts[0])
         };
 
-        // Find relation info for this table
-        let rel = relation_cache
-            .relations
-            .values()
-            .find(|r| r.schema == schema && r.name == table_name);
+        let rel = relation_cache.find_by_name(schema, table_name);
 
         if let Some(rel) = rel {
             let batch_id = Uuid::new_v4();
             let dir = staging_root.join("cdc").join(table_key);
-            std::fs::create_dir_all(&dir)?;
             let file_path = dir.join(format!("{}.parquet", batch_id));
             let relative_path = format!("cdc/{}/{}.parquet", table_key, batch_id);
 
-            write_cdc_records_to_parquet(&buffer.records, rel, &file_path)?;
+            let records = buffer.records.clone();
+            let rel = rel.clone();
+            let fp = file_path.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                std::fs::create_dir_all(fp.parent().unwrap())?;
+                write_cdc_records_to_parquet(&records, &rel, &fp)?;
+                Ok(())
+            })
+            .await??;
 
             metadata
-                .enqueue_cdc_file_and_update_lsn(
+                .enqueue_cdc_file_and_update_lsn(&EnqueueCdcFileParams {
                     slot_name,
                     schema,
-                    table_name,
-                    &relative_path,
-                    &buffer.min_lsn,
-                    &buffer.max_lsn,
-                    buffer.records.len() as i64,
-                )
+                    table: table_name,
+                    file_path: &relative_path,
+                    lsn_low: &buffer.min_lsn,
+                    lsn_high: &buffer.max_lsn,
+                    row_count: buffer.records.len() as i64,
+                })
                 .await?;
 
             tracing::info!(
@@ -460,8 +481,4 @@ async fn flush_all_buffers(
     }
 
     Ok(())
-}
-
-fn all_empty(buffers: &HashMap<String, TableBuffer>) -> bool {
-    buffers.values().all(|b| b.is_empty())
 }

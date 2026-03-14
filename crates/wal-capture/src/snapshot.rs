@@ -1,3 +1,4 @@
+use pgiceberg_common::sql::validate_snapshot_name;
 use tokio::sync::watch;
 use tokio_postgres::NoTls;
 use tracing::{info, warn};
@@ -45,6 +46,8 @@ async fn hold_snapshot(
         }
     });
 
+    validate_snapshot_name(snapshot_name)?;
+
     client
         .batch_execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .await?;
@@ -54,7 +57,6 @@ async fn hold_snapshot(
 
     info!(snapshot = snapshot_name, "Snapshot holder active");
 
-    // Hold the transaction open until signalled to stop
     let _ = cancel_rx.changed().await;
 
     client.batch_execute("COMMIT").await?;

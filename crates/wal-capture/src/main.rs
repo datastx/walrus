@@ -1,8 +1,8 @@
-pub mod backfill;
+pub(crate) mod backfill;
 mod bootstrap;
 mod cdc;
-pub mod decoder;
-pub mod parquet_writer;
+pub(crate) mod decoder;
+pub(crate) mod parquet_writer;
 mod snapshot;
 
 use clap::Parser;
@@ -51,7 +51,6 @@ async fn main() -> anyhow::Result<()> {
         "Starting WAL Capture service"
     );
 
-    // Setup graceful shutdown
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
@@ -59,7 +58,6 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    // Health server
     let health = HealthState::default();
     let health_clone = health.clone();
     tokio::spawn(async move {
@@ -68,13 +66,9 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Connect to metadata store
     let metadata = MetadataStore::connect(&config.source.connection_string()).await?;
+    let slot_info = bootstrap::bootstrap(&config.source, &config.wal_capture, &metadata).await?;
 
-    // Bootstrap: creates schema, slot, publication, table states (idempotent)
-    let slot_info = bootstrap::bootstrap(&config.source, &metadata).await?;
-
-    // Determine the snapshot name (either from fresh bootstrap or from persisted state)
     let repl_state = metadata
         .get_replication_state(&config.source.slot_name)
         .await?
@@ -85,7 +79,6 @@ async fn main() -> anyhow::Result<()> {
         .or(repl_state.consistent_point)
         .unwrap_or(Lsn::ZERO);
 
-    // Cleanup orphan staging files (written but never enqueued, e.g. crash)
     if let Err(e) = cleanup_orphan_files(&metadata, &config.staging.root).await {
         tracing::warn!("Orphan file cleanup error: {}", e);
     }
@@ -128,15 +121,14 @@ async fn main() -> anyhow::Result<()> {
                     "No snapshot available for backfill — dropping stale slot and re-bootstrapping"
                 );
 
-                // Drop stale slot, reset table states, delete old replication state
                 bootstrap::drop_replication_slot(&config.source).await?;
                 metadata.reset_tables_for_rebootstrap().await?;
                 metadata
                     .delete_replication_state(&config.source.slot_name)
                     .await?;
 
-                // Re-run bootstrap to get a fresh slot + snapshot
-                let fresh_slot = bootstrap::bootstrap(&config.source, &metadata).await?;
+                let fresh_slot =
+                    bootstrap::bootstrap(&config.source, &config.wal_capture, &metadata).await?;
                 if let Some(ref slot) = fresh_slot {
                     info!(snapshot = %slot.snapshot_name, "Re-bootstrapped — starting snapshot holder");
                     Some(snapshot::SnapshotHolder::start(
@@ -153,7 +145,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Spawn backfill task
     let backfill_handle = if has_backfill {
         let src = config.source.clone();
         let wal_cfg = config.wal_capture.clone();
@@ -171,7 +162,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Spawn CDC loop (starts immediately, doesn't wait for backfill)
     let cdc_handle = {
         let src = config.source.clone();
         let wal_cfg = config.wal_capture.clone();
@@ -179,32 +169,23 @@ async fn main() -> anyhow::Result<()> {
         let root = config.staging.root.clone();
         let shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
-            cdc::run_cdc_loop(
-                &src.host,
-                src.port,
-                &src.user,
-                &src.password(),
-                &src.database,
-                &src.slot_name,
-                &src.publication_name,
+            let params = cdc::CdcLoopParams {
+                source: &src,
                 start_lsn,
-                &wal_cfg,
-                &meta,
-                &root,
-                shutdown,
-            )
-            .await
+                config: &wal_cfg,
+                metadata: &meta,
+                staging_root: &root,
+            };
+            cdc::run_cdc_loop(&params, shutdown).await
         })
     };
 
-    // Wait for backfill to complete, then release snapshot
     if let Some(handle) = backfill_handle {
         handle.await??;
         info!("Backfill complete — releasing snapshot holder");
     }
     drop(snapshot_holder);
 
-    // Wait for CDC loop (runs until shutdown signal)
     cdc_handle.await??;
 
     info!("WAL Capture service stopped cleanly");
@@ -244,6 +225,27 @@ async fn cleanup_orphan_files(
     Ok(())
 }
 
+fn is_removable_orphan(
+    path: &std::path::Path,
+    staging_root: &std::path::Path,
+    tracked: &std::collections::HashSet<String>,
+    older_than: std::time::SystemTime,
+) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("parquet") {
+        return false;
+    }
+    let relative = match path.strip_prefix(staging_root) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let rel_str = relative.to_string_lossy().to_string();
+    if tracked.contains(&rel_str) {
+        return false;
+    }
+    let modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+    matches!(modified, Some(t) if t < older_than)
+}
+
 fn scan_and_remove_orphans(
     dir: &std::path::Path,
     staging_root: &std::path::Path,
@@ -256,20 +258,9 @@ fn scan_and_remove_orphans(
         let path = entry.path();
         if path.is_dir() {
             scan_and_remove_orphans(&path, staging_root, tracked, older_than, count)?;
-        } else if path.extension().and_then(|e| e.to_str()) == Some("parquet") {
-            if let Ok(relative) = path.strip_prefix(staging_root) {
-                let rel_str = relative.to_string_lossy().to_string();
-                if !tracked.contains(&rel_str) {
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        if let Ok(modified) = meta.modified() {
-                            if modified < older_than {
-                                std::fs::remove_file(&path).ok();
-                                *count += 1;
-                            }
-                        }
-                    }
-                }
-            }
+        } else if is_removable_orphan(&path, staging_root, tracked, older_than) {
+            std::fs::remove_file(&path).ok();
+            *count += 1;
         }
     }
     Ok(())

@@ -34,7 +34,6 @@ pub async fn run_processing_loop(
     let reclaim_interval = Duration::from_secs(300);
     let mut last_reclaim = Instant::now();
 
-    // Cache of table state (PK columns, loaded Iceberg table handles)
     let mut pk_cache: HashMap<String, Vec<String>> = HashMap::new();
 
     loop {
@@ -43,7 +42,6 @@ pub async fn run_processing_loop(
             break;
         }
 
-        // Periodic reclaim of stale processing files
         if last_reclaim.elapsed() >= reclaim_interval {
             match metadata.reclaim_stale_processing().await {
                 Ok(count) if count > 0 => {
@@ -57,12 +55,10 @@ pub async fn run_processing_loop(
             last_reclaim = Instant::now();
         }
 
-        // Step 1: Process any pending DDL events first
         if let Err(e) = ddl_handler::process_ddl_events(metadata, catalog).await {
             warn!("DDL processing error: {}", e);
         }
 
-        // Step 2: Claim next batch of files
         let files = metadata
             .claim_next_batch(writer_config.max_files_per_batch)
             .await?;
@@ -83,17 +79,14 @@ pub async fn run_processing_loop(
             "Claimed batch for processing"
         );
 
-        // Ensure we know the PK columns for this table
         let pk_columns = if let Some(cached) = pk_cache.get(&table_key) {
             cached.clone()
         } else {
-            // Re-discover from source (stateless recovery)
             let pk = discover_pk_for_table(source_config, metadata, &files[0]).await?;
             pk_cache.insert(table_key.clone(), pk.clone());
             pk
         };
 
-        // Ensure Iceberg table exists
         let mut table = catalog::ensure_iceberg_table(
             catalog,
             metadata,
@@ -103,10 +96,12 @@ pub async fn run_processing_loop(
         )
         .await?;
 
-        // Process based on file type
         let file_ids: Vec<uuid::Uuid> = files.iter().map(|f| f.file_id).collect();
 
-        let result = if files.iter().all(|f| f.file_type == "backfill") {
+        let result = if files
+            .iter()
+            .all(|f| f.file_type == pgiceberg_common::models::FileType::Backfill)
+        {
             backfill_processor::process_backfill_batch(&mut table, &files, staging_root, catalog)
                 .await
         } else {
@@ -150,13 +145,11 @@ async fn discover_pk_for_table(
     metadata: &MetadataStore,
     file: &FileQueueEntry,
 ) -> anyhow::Result<Vec<String>> {
-    // First check config
     let from_config = source_config.pk_for_table(&file.table_schema, &file.table_name);
     if !from_config.is_empty() {
         return Ok(from_config);
     }
 
-    // Then check persisted table_state
     if let Some(state) = metadata
         .get_table_state(&file.table_schema, &file.table_name)
         .await?
@@ -166,7 +159,6 @@ async fn discover_pk_for_table(
         }
     }
 
-    // Finally discover from pg_index
     let pk = metadata
         .discover_primary_keys(&file.table_schema, &file.table_name)
         .await?;

@@ -15,14 +15,13 @@ pub fn test_config() -> AppConfig {
     let user = std::env::var("TEST_PG_USER").unwrap_or_else(|_| "replicator".to_string());
     let password = std::env::var("TEST_PG_PASSWORD").unwrap_or_else(|_| "testpass".to_string());
 
-    std::env::set_var("PG_PASSWORD", &password);
-
     AppConfig {
         source: SourceConfig {
             host,
             port,
             database,
             user,
+            password_override: Some(password),
             password_env: "PG_PASSWORD".to_string(),
             slot_name: format!(
                 "test_slot_{}",
@@ -67,7 +66,6 @@ pub async fn cleanup(config: &AppConfig) {
                 conn.await.ok();
             });
 
-            // Drop slot if it exists
             client
                 .execute(
                     &format!(
@@ -79,7 +77,6 @@ pub async fn cleanup(config: &AppConfig) {
                 .await
                 .ok();
 
-            // Drop publication
             client
                 .execute(
                     &format!(
@@ -93,7 +90,6 @@ pub async fn cleanup(config: &AppConfig) {
         }
     }
 
-    // Remove staging/warehouse dirs
     std::fs::remove_dir_all(&config.staging.root).ok();
     std::fs::remove_dir_all(&config.iceberg_writer.warehouse_path).ok();
 }

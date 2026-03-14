@@ -34,8 +34,9 @@ pub async fn process_cdc_batch(
         );
     }
 
-    let engine = DuckDbEngine::new()?;
     let temp_dir = tempfile::tempdir()?;
+    let upsert_path = temp_dir.path().join("upsert.parquet");
+    let delete_path = temp_dir.path().join("delete_keys.parquet");
 
     let file_paths: Vec<String> = files
         .iter()
@@ -53,16 +54,21 @@ pub async fn process_cdc_batch(
         return Ok(());
     }
 
-    engine.load_staged_files(&file_paths)?;
-    engine.dedup_by_pk(pk_columns)?;
-    engine.separate_operations(pk_columns)?;
-
-    let upsert_path = temp_dir.path().join("upsert.parquet");
-    let delete_path = temp_dir.path().join("delete_keys.parquet");
-
-    let upsert_count = engine.export_upserts(&upsert_path)?;
-    let delete_count = engine.export_deletes(&delete_path)?;
-    engine.cleanup()?;
+    let pk_cols = pk_columns.to_vec();
+    let up = upsert_path.clone();
+    let dp = delete_path.clone();
+    let (upsert_count, delete_count) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, u64)> {
+            let engine = DuckDbEngine::new()?;
+            engine.load_staged_files(&file_paths)?;
+            engine.dedup_by_pk(&pk_cols)?;
+            engine.separate_operations(&pk_cols)?;
+            let uc = engine.export_upserts(&up)?;
+            let dc = engine.export_deletes(&dp)?;
+            engine.cleanup()?;
+            Ok((uc, dc))
+        })
+        .await??;
 
     let mut all_data_files = Vec::new();
 
