@@ -76,6 +76,7 @@ struct CdcState<'a> {
     slot_name: &'a str,
     staging_root: &'a Path,
     config: &'a WalCaptureConfig,
+    next_seq: i64,
 }
 
 impl<'a> CdcState<'a> {
@@ -96,6 +97,7 @@ impl<'a> CdcState<'a> {
             slot_name,
             staging_root,
             config,
+            next_seq: 0,
         }
     }
 
@@ -112,6 +114,8 @@ impl<'a> CdcState<'a> {
             for mut record in txn.records {
                 record.commit_lsn = end_lsn;
                 record.commit_ts = commit_ts;
+                record.seq = self.next_seq;
+                self.next_seq += 1;
                 let key = format!("{}.{}", record.table_schema, record.table_name);
                 self.total_buffered_rows += 1;
                 self.total_buffered_bytes += record.estimated_bytes;
@@ -381,6 +385,7 @@ fn tuple_to_cdc_record(
         estimated_bytes,
         commit_lsn,
         commit_ts,
+        seq: 0,
     }
 }
 

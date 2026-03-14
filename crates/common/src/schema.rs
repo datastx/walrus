@@ -94,6 +94,7 @@ pub fn cdc_metadata_fields() -> Vec<Field> {
     vec![
         Field::new("_pgiceberg_op", DataType::Utf8, false),
         Field::new("_pgiceberg_ts", DataType::Int64, false),
+        Field::new("_pgiceberg_seq", DataType::Int64, false),
     ]
 }
 

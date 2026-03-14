@@ -192,6 +192,8 @@ pub struct CdcRecord {
     pub estimated_bytes: usize,
     pub commit_lsn: Lsn,
     pub commit_ts: i64,
+    /// Monotonic sequence number within a transaction for deterministic dedup ordering.
+    pub seq: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
