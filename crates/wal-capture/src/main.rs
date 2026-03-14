@@ -7,7 +7,7 @@ mod snapshot;
 
 use clap::Parser;
 use pgiceberg_common::config::AppConfig;
-use pgiceberg_common::health::{serve_health, HealthState};
+use pgiceberg_common::health::{install_metrics_recorder, serve_health, HealthState};
 use pgiceberg_common::metadata::MetadataStore;
 use pgiceberg_common::models::{Lsn, TablePhase};
 use std::path::PathBuf;
@@ -43,11 +43,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = AppConfig::load(&cli.config)?;
 
+    let metrics_handle = install_metrics_recorder();
+
     info!(
         host = %config.source.host,
         database = %config.source.database,
         slot = %config.source.slot_name,
         tables = config.source.tables.len(),
+        tls_mode = ?config.source.tls_mode,
         "Starting WAL Capture service"
     );
 
@@ -58,7 +61,10 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let health = HealthState::default();
+    let health = HealthState {
+        metrics_handle: Some(metrics_handle),
+        ..Default::default()
+    };
     let health_clone = health.clone();
     tokio::spawn(async move {
         if let Err(e) = serve_health(config.wal_capture.health_port, health_clone).await {
@@ -66,7 +72,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let metadata = MetadataStore::connect(&config.source.connection_string()).await?;
+    let metadata = MetadataStore::connect_with_tls(
+        &config.source.connection_string(),
+        &config.source.tls_mode,
+        config.source.tls_ca_cert.as_deref(),
+    )
+    .await?;
     let slot_info = bootstrap::bootstrap(&config.source, &config.wal_capture, &metadata).await?;
 
     let repl_state = metadata
@@ -114,6 +125,8 @@ async fn main() -> anyhow::Result<()> {
                 Some(snapshot::SnapshotHolder::start(
                     config.source.connection_string(),
                     snap,
+                    config.source.tls_mode.clone(),
+                    config.source.tls_ca_cert.clone(),
                 ))
             }
             None => {
@@ -134,6 +147,8 @@ async fn main() -> anyhow::Result<()> {
                     Some(snapshot::SnapshotHolder::start(
                         config.source.connection_string(),
                         slot.snapshot_name.clone(),
+                        config.source.tls_mode.clone(),
+                        config.source.tls_ca_cert.clone(),
                     ))
                 } else {
                     tracing::error!("Re-bootstrap did not produce a snapshot — cannot backfill");

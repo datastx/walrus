@@ -24,6 +24,12 @@ axum = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+rustls = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pki-types = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

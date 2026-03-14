@@ -3,9 +3,15 @@ host = "localhost"
 port = 5432
 database = "sourcedb"
 user = "replicator"
-password_env = "PG_PASSWORD"
-slot_name = "pgiceberg_slot"
-publication_name = "pgiceberg_pub"
+# password = "secret"               # Direct password (or use PG_PASSWORD env var)
+password_env = "PG_PASSWORD"        # Legacy: env var name to read password from
+slot_name = "pgiceberg_slot"        # Override: PG_SLOT_NAME
+publication_name = "pgiceberg_pub"  # Override: PG_PUBLICATION_NAME
+
+# TLS mode: disable | prefer | require | verify-ca | verify-full
+# Override: PG_TLS_MODE
+tls_mode = "disable"
+# tls_ca_cert = "/etc/ssl/certs/ca.pem"  # Override: PG_TLS_CA_CERT
 
 [source.tables]
 # schema.table = { pk = ["col1", "col2"] }
@@ -15,26 +21,28 @@ publication_name = "pgiceberg_pub"
 "public.products" = { pk = ["product_id"] }
 
 [staging]
-root = "/data/staging"
-cleanup_after_hours = 24
+root = "/data/staging"              # Override: STAGING_ROOT
+cleanup_after_hours = 24            # Override: CLEANUP_AFTER_HOURS
 
 [wal_capture]
-max_parallel_tables = 4
+max_parallel_tables = 4             # Override: MAX_PARALLEL_TABLES
 max_parallel_workers_per_table = 2
-rows_per_partition = 500_000
+rows_per_partition = 500_000        # Override: ROWS_PER_PARTITION
 
 # CDC flush policy: flush triggers when ANY threshold is reached.
 # Set a threshold to 0 to disable that trigger.
-max_batch_rows = 50_000
-max_batch_bytes = 67_108_864      # 64 MiB
-flush_interval_seconds = 30
+max_batch_rows = 50_000             # Override: MAX_BATCH_ROWS
+max_batch_bytes = 67_108_864        # 64 MiB — Override: MAX_BATCH_BYTES
+flush_interval_seconds = 30         # Override: FLUSH_INTERVAL_SECONDS
 idle_timeout_seconds = 60
+health_port = 8081                  # Override: WAL_CAPTURE_HEALTH_PORT
 
 [iceberg_writer]
-warehouse_path = "/data/iceberg"
+warehouse_path = "/data/iceberg"    # Override: WAREHOUSE_PATH
 catalog_db_path = "/data/iceberg/catalog.db"
-poll_interval_seconds = 5
-max_files_per_batch = 100
+poll_interval_seconds = 5           # Override: POLL_INTERVAL_SECONDS
+max_files_per_batch = 100           # Override: MAX_FILES_PER_BATCH
 compaction_interval_hours = 6
 compaction_delete_threshold = 50
-max_retries = 3
+max_retries = 3                     # Override: MAX_RETRIES
+health_port = 8082                  # Override: ICEBERG_WRITER_HEALTH_PORT

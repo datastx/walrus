@@ -1,6 +1,7 @@
+use crate::config::TlsMode;
 use crate::models::*;
-use deadpool_postgres::{Config, Pool, Runtime};
-use tokio_postgres::NoTls;
+use crate::tls;
+use deadpool_postgres::{Config, Pool};
 use uuid::Uuid;
 
 pub struct EnqueueFileParams<'a> {
@@ -39,7 +40,17 @@ pub struct MetadataStore {
 }
 
 impl MetadataStore {
+    /// Connect with TLS disabled (backward compatible).
     pub async fn connect(conn_string: &str) -> anyhow::Result<Self> {
+        Self::connect_with_tls(conn_string, &TlsMode::Disable, None).await
+    }
+
+    /// Connect with configurable TLS mode.
+    pub async fn connect_with_tls(
+        conn_string: &str,
+        tls_mode: &TlsMode,
+        ca_cert_path: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
         let mut cfg = Config::new();
         for part in conn_string.split_whitespace() {
             let kv: Vec<&str> = part.splitn(2, '=').collect();
@@ -55,7 +66,7 @@ impl MetadataStore {
                 _ => {}
             }
         }
-        let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
+        let pool = tls::create_pg_pool(cfg, tls_mode, ca_cert_path)?;
         Ok(Self { pool })
     }
 

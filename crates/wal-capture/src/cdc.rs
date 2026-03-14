@@ -1,6 +1,6 @@
 use crate::decoder::*;
 use crate::parquet_writer::write_cdc_records_to_parquet;
-use pgiceberg_common::config::{SourceConfig, WalCaptureConfig};
+use pgiceberg_common::config::{SourceConfig, TlsMode, WalCaptureConfig};
 use pgiceberg_common::metadata::{EnqueueCdcFileParams, MetadataStore};
 use pgiceberg_common::models::*;
 use std::collections::HashMap;
@@ -205,6 +205,16 @@ impl<'a> CdcState<'a> {
     }
 }
 
+/// Map our TlsMode to pgwire-replication's TlsConfig.
+fn make_replication_tls(source: &SourceConfig) -> TlsConfig {
+    match source.tls_mode {
+        TlsMode::Disable => TlsConfig::disabled(),
+        TlsMode::Prefer | TlsMode::Require => TlsConfig::require(),
+        TlsMode::VerifyCa => TlsConfig::verify_ca(source.tls_ca_cert.clone()),
+        TlsMode::VerifyFull => TlsConfig::verify_full(source.tls_ca_cert.clone()),
+    }
+}
+
 /// Runs the CDC streaming loop.
 ///
 /// Starts reading WAL immediately from the replication slot's consistent_point.
@@ -237,7 +247,7 @@ pub async fn run_cdc_loop(
         user: source.user.clone(),
         password: source.password(),
         database: source.database.clone(),
-        tls: TlsConfig::disabled(),
+        tls: make_replication_tls(source),
         slot: source.slot_name.clone(),
         publication: source.publication_name.clone(),
         start_lsn: repl_lsn,
@@ -250,10 +260,12 @@ pub async fn run_cdc_loop(
     tracing::info!(
         start_lsn = %start_lsn,
         slot = slot_name,
+        tls_mode = ?source.tls_mode,
         "Starting CDC loop"
     );
 
-    let mut client = ReplicationClient::connect(repl_config).await?;
+    // Connect with retry/backoff
+    let mut client = connect_with_retry(repl_config.clone(), &mut shutdown_rx).await?;
     let mut state = CdcState::new(
         params.metadata,
         slot_name,
@@ -292,6 +304,7 @@ pub async fn run_cdc_loop(
                             pgwire_replication::Lsn::parse(&Lsn(wal_end.into()).to_string())
                                 .unwrap_or(repl_lsn),
                         );
+                        metrics::counter!("walrus_cdc_commits_total").increment(1);
                     }
                     PgOutputMessage::Relation {
                         oid,
@@ -303,16 +316,25 @@ pub async fn run_cdc_loop(
                     PgOutputMessage::Insert {
                         relation_oid,
                         tuple,
-                    } => state.handle_insert(relation_oid, &tuple).await?,
+                    } => {
+                        state.handle_insert(relation_oid, &tuple).await?;
+                        metrics::counter!("walrus_cdc_rows_total", "op" => "insert").increment(1);
+                    }
                     PgOutputMessage::Update {
                         relation_oid,
                         new_tuple,
                         ..
-                    } => state.handle_update(relation_oid, &new_tuple),
+                    } => {
+                        state.handle_update(relation_oid, &new_tuple);
+                        metrics::counter!("walrus_cdc_rows_total", "op" => "update").increment(1);
+                    }
                     PgOutputMessage::Delete {
                         relation_oid,
                         old_tuple,
-                    } => state.handle_delete(relation_oid, &old_tuple),
+                    } => {
+                        state.handle_delete(relation_oid, &old_tuple);
+                        metrics::counter!("walrus_cdc_rows_total", "op" => "delete").increment(1);
+                    }
                     _ => {}
                 }
 
@@ -337,12 +359,58 @@ pub async fn run_cdc_loop(
             }
             Err(e) => {
                 tracing::error!("Replication error: {}", e);
-                return Err(e.into());
+                metrics::counter!("walrus_cdc_errors_total").increment(1);
+
+                // Attempt reconnection with backoff instead of crashing
+                tracing::info!("Attempting to reconnect to replication stream...");
+                state.flush().await.ok(); // best-effort flush before reconnect
+                match connect_with_retry(repl_config.clone(), &mut shutdown_rx).await {
+                    Ok(new_client) => {
+                        client = new_client;
+                        metrics::counter!("walrus_cdc_reconnects_total").increment(1);
+                        tracing::info!("Reconnected to replication stream");
+                        continue;
+                    }
+                    Err(reconnect_err) => {
+                        tracing::error!("Failed to reconnect after retries: {}", reconnect_err);
+                        return Err(reconnect_err);
+                    }
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Connect to the replication stream with exponential backoff.
+/// Retries up to 5 times with 1s initial delay, 30s max.
+async fn connect_with_retry(
+    config: ReplicationConfig,
+    shutdown_rx: &mut watch::Receiver<bool>,
+) -> anyhow::Result<ReplicationClient> {
+    let backoff = backoff::ExponentialBackoffBuilder::new()
+        .with_initial_interval(std::time::Duration::from_secs(1))
+        .with_max_interval(std::time::Duration::from_secs(30))
+        .with_max_elapsed_time(Some(std::time::Duration::from_secs(300)))
+        .build();
+
+    let op = || async {
+        if *shutdown_rx.borrow() {
+            return Err(backoff::Error::Permanent(anyhow::anyhow!(
+                "Shutdown during reconnect"
+            )));
+        }
+        ReplicationClient::connect(config.clone())
+            .await
+            .map_err(|e| {
+                tracing::warn!("Replication connect failed: {} — retrying", e);
+                metrics::counter!("walrus_cdc_connect_retries_total").increment(1);
+                backoff::Error::transient(anyhow::anyhow!(e))
+            })
+    };
+
+    backoff::future::retry(backoff, op).await
 }
 
 fn tuple_to_cdc_record(
@@ -474,6 +542,10 @@ async fn flush_all_buffers(
                 lsn_high = %buffer.max_lsn,
                 "Flushed CDC batch"
             );
+            metrics::counter!("walrus_cdc_flushes_total", "table" => table_key.clone())
+                .increment(1);
+            metrics::counter!("walrus_cdc_rows_flushed_total", "table" => table_key.clone())
+                .increment(buffer.records.len() as u64);
         } else {
             tracing::warn!(
                 table_key,

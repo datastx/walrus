@@ -1,28 +1,35 @@
+use pgiceberg_common::config::TlsMode;
 use pgiceberg_common::sql::validate_snapshot_name;
+use pgiceberg_common::tls;
+use std::path::PathBuf;
 use tokio::sync::watch;
-use tokio_postgres::NoTls;
 use tracing::{info, warn};
 
 /// Holds a Postgres transaction with `SET TRANSACTION SNAPSHOT` alive for the
 /// duration of all backfills.
-///
-/// The snapshot was created by `pg_create_logical_replication_slot`.  As long as
-/// at least one transaction keeps the snapshot pinned, backfill workers can open
-/// new connections and `SET TRANSACTION SNAPSHOT` to read a consistent view.
-///
-/// When all backfills are done, drop the holder to release the connection.
 pub struct SnapshotHolder {
     _cancel_tx: watch::Sender<bool>,
 }
 
 impl SnapshotHolder {
-    /// Spawns a background task that holds the snapshot alive.
-    /// Returns a handle; dropping it signals the holder to close.
-    pub fn start(conn_string: String, snapshot_name: String) -> Self {
+    pub fn start(
+        conn_string: String,
+        snapshot_name: String,
+        tls_mode: TlsMode,
+        tls_ca_cert: Option<PathBuf>,
+    ) -> Self {
         let (cancel_tx, mut cancel_rx) = watch::channel(false);
 
         tokio::spawn(async move {
-            match hold_snapshot(&conn_string, &snapshot_name, &mut cancel_rx).await {
+            match hold_snapshot(
+                &conn_string,
+                &snapshot_name,
+                &tls_mode,
+                tls_ca_cert.as_deref(),
+                &mut cancel_rx,
+            )
+            .await
+            {
                 Ok(()) => info!("Snapshot holder released cleanly"),
                 Err(e) => warn!("Snapshot holder exited with error: {}", e),
             }
@@ -37,14 +44,11 @@ impl SnapshotHolder {
 async fn hold_snapshot(
     conn_string: &str,
     snapshot_name: &str,
+    tls_mode: &TlsMode,
+    tls_ca_cert: Option<&std::path::Path>,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let (client, conn) = tokio_postgres::connect(conn_string, NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::error!("Snapshot holder connection error: {}", e);
-        }
-    });
+    let (client, _conn_handle) = tls::pg_connect(conn_string, tls_mode, tls_ca_cert).await?;
 
     validate_snapshot_name(snapshot_name)?;
 

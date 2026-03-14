@@ -3,7 +3,8 @@ use pgiceberg_common::config::WalCaptureConfig;
 use pgiceberg_common::metadata::MetadataStore;
 use pgiceberg_common::models::TablePhase;
 use pgiceberg_common::sql::quote_ident;
-use tokio_postgres::{Client, NoTls};
+use pgiceberg_common::tls;
+use tokio_postgres::Client;
 use tracing::{info, warn};
 
 /// Slot creation result from `CREATE_REPLICATION_SLOT`.
@@ -38,12 +39,12 @@ pub async fn bootstrap(
 
     info!(slot = %config.slot_name, "No existing state — fresh bootstrap");
 
-    let (client, conn) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::error!("bootstrap connection error: {}", e);
-        }
-    });
+    let (client, _conn_handle) = tls::pg_connect(
+        &config.connection_string(),
+        &config.tls_mode,
+        config.tls_ca_cert.as_deref(),
+    )
+    .await?;
 
     ensure_publication(&client, config).await?;
     let slot_info = create_replication_slot(&client, config).await?;
@@ -80,12 +81,12 @@ pub async fn bootstrap(
 
 /// Drop a replication slot. Used for recovery when the snapshot has expired.
 pub async fn drop_replication_slot(config: &SourceConfig) -> anyhow::Result<()> {
-    let (client, conn) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::error!("drop_replication_slot connection error: {}", e);
-        }
-    });
+    let (client, _conn_handle) = tls::pg_connect(
+        &config.connection_string(),
+        &config.tls_mode,
+        config.tls_ca_cert.as_deref(),
+    )
+    .await?;
 
     let exists: bool = client
         .query_one(

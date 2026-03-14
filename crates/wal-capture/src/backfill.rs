@@ -3,8 +3,8 @@ use pgiceberg_common::config::{SourceConfig, WalCaptureConfig};
 use pgiceberg_common::metadata::{EnqueueFileParams, MetadataStore};
 use pgiceberg_common::models::{CtidPartition, FileType, TablePhase, TableState};
 use pgiceberg_common::sql::{quote_ident, validate_snapshot_name};
+use pgiceberg_common::tls;
 use std::path::Path;
-use tokio_postgres::NoTls;
 use tracing::info;
 
 /// Calculate CTID partitions for a table.
@@ -118,12 +118,12 @@ async fn backfill_single_table(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("No snapshot name for {}.{}", schema, table))?;
 
-    let (client, conn) = tokio_postgres::connect(&source_config.connection_string(), NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::error!("backfill connection error: {}", e);
-        }
-    });
+    let (client, _conn_handle) = tls::pg_connect(
+        &source_config.connection_string(),
+        &source_config.tls_mode,
+        source_config.tls_ca_cert.as_deref(),
+    )
+    .await?;
 
     let row = client
         .query_one(
@@ -190,12 +190,12 @@ async fn backfill_partition(
     partition: &CtidPartition,
     total_partitions: usize,
 ) -> anyhow::Result<()> {
-    let (client, conn) = tokio_postgres::connect(&source_config.connection_string(), NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::error!("partition connection error: {}", e);
-        }
-    });
+    let (client, _conn_handle) = tls::pg_connect(
+        &source_config.connection_string(),
+        &source_config.tls_mode,
+        source_config.tls_ca_cert.as_deref(),
+    )
+    .await?;
 
     validate_snapshot_name(snapshot_name)?;
 

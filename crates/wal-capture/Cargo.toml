@@ -34,6 +34,12 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tokio-util = { workspace = true }
+backoff = { workspace = true }
+rustls = { workspace = true }
+tokio-postgres-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pki-types = { workspace = true }
+metrics = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
