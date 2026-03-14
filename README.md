@@ -61,7 +61,17 @@ Walrus tackles this from two angles:
 
 When streaming is enabled, the server-side benefits are significant: the [`ReorderBuffer`](https://www.postgresql.org/docs/current/reorder-buffer.html) no longer needs to hold the full transaction in memory or on disk, WAL segments are released earlier because the slot's restart LSN can advance during the transaction, and the "dam burst" latency spike at commit time is eliminated because data arrives incrementally. PostgreSQL 16 extended this further with [`streaming = parallel`](https://www.postgresql.org/docs/16/logical-replication-config.html), which applies streamed transactions in parallel workers for a reported 50-60% throughput improvement, though Walrus does not yet distinguish between the two modes.
 
-To enable streaming, set `streaming = true` in the WAL Capture configuration (or the `CDC_STREAMING` environment variable). This requires PostgreSQL 14 or later. On older versions, leave streaming disabled -- the spill-to-disk mechanism still protects against OOM.
+To enable streaming, set `streaming = true` in the WAL Capture configuration (or the `CDC_STREAMING` environment variable).
+
+#### Idle WAL Reclamation (Heartbeat)
+
+When no writes happen on the source database, the replication slot's `confirmed_flush_lsn` never advances. PostgreSQL cannot reclaim old WAL segments, leading to unbounded disk growth. Every major CDC tool (PeerDB, Debezium, Fivetran) solves this by generating periodic small writes that flow through the replication slot.
+
+Walrus uses two complementary mechanisms:
+
+**KeepAlive LSN advancement.** When the CDC loop is truly idle (no in-flight transaction, no streaming transactions, all table buffers empty), the server's periodic KeepAlive message includes the current WAL tip. Since nothing is pending, Walrus reports this position as its applied LSN, allowing PostgreSQL to reclaim WAL up to that point. This is a zero-cost optimization that requires no configuration.
+
+**`pg_logical_emit_message()` heartbeat.** A background task periodically calls `SELECT pg_logical_emit_message(true, 'walrus_heartbeat', 'tick')`, which writes a lightweight transactional logical message directly into WAL. This generates a Begin/Message/Commit sequence that flows through the replication slot, causing the CDC consumer to process the commit and advance its confirmed LSN. Unlike the heartbeat-table approach used by other tools, this requires no extra table, no publication changes, and no record filtering -- it is the lightest possible mechanism. The interval is configurable via `heartbeat_interval_seconds` (default: 5 minutes, set to 0 to disable).
 
 **Source-side guardrails.** Independent of the above, the source PostgreSQL should be configured to limit the blast radius of large transactions:
 
@@ -201,7 +211,8 @@ Key settings:
 | Flush byte threshold | CDC buffer bytes before flush | 64 MB |
 | Flush time threshold | Seconds before time-based flush | 30 |
 | Max txn memory | In-flight transaction bytes before spilling to disk | 128 MB |
-| Streaming | Enable pgoutput v2 streaming for large transactions (PG14+) | false |
+| Streaming | Enable pgoutput v2 streaming for large transactions | false |
+| Heartbeat interval | Seconds between heartbeat ticks for idle WAL reclamation (0 = disabled) | 300 |
 | Backfill parallelism | Concurrent tables during export | 4 |
 | Rows per partition | CTID range size for export chunks | 500,000 |
 | Warehouse path | Iceberg warehouse directory | /data/iceberg |
@@ -229,6 +240,7 @@ Walrus is designed for Kubernetes:
 
 The source database needs:
 
+- **PostgreSQL 14 or later** -- required for pgoutput protocol v2 streaming of large in-progress transactions and `pg_logical_emit_message()` support used by the idle WAL reclamation heartbeat
 - `wal_level = logical`
 - At least one available replication slot and WAL sender
 - A user with `REPLICATION` privilege and `SELECT` on the replicated tables

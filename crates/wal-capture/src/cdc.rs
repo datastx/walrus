@@ -344,6 +344,16 @@ impl<'a> CdcState<'a> {
         }
     }
 
+    /// Returns true when the CDC loop has no in-flight work: no active
+    /// transaction, no streaming transactions, and all table buffers flushed.
+    /// Used to decide whether a KeepAlive's wal_end is safe to report as our
+    /// applied position.
+    fn is_idle(&self) -> bool {
+        self.current_txn.is_none()
+            && self.streaming_txns.is_empty()
+            && self.table_buffers.values().all(|b| b.records.is_empty())
+    }
+
     fn should_flush(&self) -> bool {
         let rows = self.config.max_batch_rows > 0
             && self.total_buffered_rows >= self.config.max_batch_rows;
@@ -541,7 +551,19 @@ pub async fn run_cdc_loop(
                     state.flush().await?;
                 }
             }
-            Ok(Some(ReplicationEvent::KeepAlive { .. })) => {}
+            Ok(Some(ReplicationEvent::KeepAlive { wal_end, .. })) => {
+                if state.is_idle() {
+                    client.update_applied_lsn(wal_end);
+                    tracing::trace!(%wal_end, "Advanced LSN via keepalive (idle)");
+                    metrics::counter!("walrus_cdc_idle_lsn_advances_total").increment(1);
+                }
+            }
+            Ok(Some(ReplicationEvent::Message { prefix, .. })) => {
+                if prefix == "walrus_heartbeat" {
+                    tracing::trace!("Received heartbeat message");
+                    metrics::counter!("walrus_heartbeat_messages_total").increment(1);
+                }
+            }
             Ok(Some(ReplicationEvent::StoppedAt { .. })) => {
                 tracing::info!("Replication stream ended");
                 break;

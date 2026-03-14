@@ -2,6 +2,7 @@ pub(crate) mod backfill;
 mod bootstrap;
 mod cdc;
 pub(crate) mod decoder;
+mod heartbeat;
 pub(crate) mod parquet_writer;
 mod snapshot;
 pub(crate) mod spill;
@@ -178,6 +179,15 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let heartbeat_handle = {
+        let meta = metadata.clone();
+        let interval = config.wal_capture.heartbeat_interval_seconds;
+        let shutdown = shutdown_rx.clone();
+        tokio::spawn(async move {
+            heartbeat::run_heartbeat_loop(meta, interval, shutdown).await;
+        })
+    };
+
     let cdc_handle = {
         let src = config.source.clone();
         let wal_cfg = config.wal_capture.clone();
@@ -203,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
     drop(snapshot_holder);
 
     cdc_handle.await??;
+    heartbeat_handle.abort();
 
     info!("WAL Capture service stopped cleanly");
     Ok(())
