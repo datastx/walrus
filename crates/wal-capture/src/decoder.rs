@@ -2,7 +2,7 @@ use pgiceberg_common::models::*;
 use std::collections::HashMap;
 use tracing::trace;
 
-/// Decodes raw pgoutput v2 binary messages into typed events.
+/// Decodes raw pgoutput v1/v2 binary messages into typed events.
 ///
 /// pgwire-replication gives us raw XLogData bytes.  This module parses the
 /// pgoutput protocol framing:
@@ -15,6 +15,12 @@ use tracing::trace;
 ///   - 'T' = Truncate
 ///   - 'Y' = Type
 ///   - 'O' = Origin
+///
+/// Protocol v2 streaming (PG14+):
+///   - 'S' = Stream Start
+///   - 'E' = Stream Stop
+///   - 'c' = Stream Commit
+///   - 'A' = Stream Abort
 
 // Protocol-defined variants and fields must exist for correct decoding
 // even if not all are consumed by the application.
@@ -64,6 +70,26 @@ pub enum PgOutputMessage {
         lsn: Lsn,
         name: String,
     },
+    /// Protocol v2: Start of a streamed transaction segment.
+    StreamStart {
+        xid: u32,
+        first_segment: bool,
+    },
+    /// Protocol v2: End of a streamed transaction segment.
+    StreamStop,
+    /// Protocol v2: Commit a streamed transaction.
+    StreamCommit {
+        flags: u8,
+        xid: u32,
+        commit_lsn: Lsn,
+        end_lsn: Lsn,
+        commit_ts: i64,
+    },
+    /// Protocol v2: Abort a streamed transaction.
+    StreamAbort {
+        xid: u32,
+        subxid: u32,
+    },
     /// Message types we don't handle — skip silently.
     Unknown(u8),
 }
@@ -109,6 +135,11 @@ pub fn decode_pgoutput(data: &[u8]) -> anyhow::Result<PgOutputMessage> {
         b'T' => decode_truncate(body),
         b'Y' => decode_type(body),
         b'O' => decode_origin(body),
+        // Protocol v2 streaming messages (PG14+)
+        b'S' => decode_stream_start(body),
+        b'E' => Ok(PgOutputMessage::StreamStop),
+        b'c' => decode_stream_commit(body),
+        b'A' => decode_stream_abort(body),
         _ => {
             trace!(msg_type = msg_type, "Unknown pgoutput message type");
             Ok(PgOutputMessage::Unknown(msg_type))
@@ -324,6 +355,36 @@ fn decode_origin(data: &[u8]) -> anyhow::Result<PgOutputMessage> {
     let lsn = Lsn(read_u64(data, &mut pos));
     let name = read_string(data, &mut pos);
     Ok(PgOutputMessage::Origin { lsn, name })
+}
+
+fn decode_stream_start(data: &[u8]) -> anyhow::Result<PgOutputMessage> {
+    let mut pos = 0;
+    let xid = read_u32(data, &mut pos);
+    let first_segment = read_u8(data, &mut pos) == 1;
+    Ok(PgOutputMessage::StreamStart { xid, first_segment })
+}
+
+fn decode_stream_commit(data: &[u8]) -> anyhow::Result<PgOutputMessage> {
+    let mut pos = 0;
+    let flags = read_u8(data, &mut pos);
+    let xid = read_u32(data, &mut pos);
+    let commit_lsn = Lsn(read_u64(data, &mut pos));
+    let end_lsn = Lsn(read_u64(data, &mut pos));
+    let commit_ts = read_i64(data, &mut pos);
+    Ok(PgOutputMessage::StreamCommit {
+        flags,
+        xid,
+        commit_lsn,
+        end_lsn,
+        commit_ts,
+    })
+}
+
+fn decode_stream_abort(data: &[u8]) -> anyhow::Result<PgOutputMessage> {
+    let mut pos = 0;
+    let xid = read_u32(data, &mut pos);
+    let subxid = read_u32(data, &mut pos);
+    Ok(PgOutputMessage::StreamAbort { xid, subxid })
 }
 
 /// Manages OID → RelationInfo mapping.  Populated by Relation messages in the

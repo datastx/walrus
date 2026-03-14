@@ -15,8 +15,8 @@ postgres-types = { version = "0.2", features = ["with-chrono-0_4", "with-uuid-1"
 deadpool-postgres = "0.14"
 postgres-protocol = "0.6"
 
-# Logical replication
-pgwire-replication = "0.2"
+# Logical replication (local fork with proto v2 streaming support)
+pgwire-replication = { path = "crates/pgwire-replication" }
 
 # Arrow / Parquet
 arrow = { version = "57", features = ["prettyprint"] }

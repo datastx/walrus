@@ -4,6 +4,7 @@ mod cdc;
 pub(crate) mod decoder;
 pub(crate) mod parquet_writer;
 mod snapshot;
+pub(crate) mod spill;
 
 use clap::Parser;
 use pgiceberg_common::config::AppConfig;

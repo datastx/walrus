@@ -1,5 +1,6 @@
 use crate::decoder::*;
 use crate::parquet_writer::write_cdc_records_to_parquet;
+use crate::spill::{SpillFile, SPILL_CHUNK_SIZE};
 use pgiceberg_common::config::{SourceConfig, TlsMode, WalCaptureConfig};
 use pgiceberg_common::metadata::{EnqueueCdcFileParams, MetadataStore};
 use pgiceberg_common::models::*;
@@ -63,12 +64,21 @@ impl TableBuffer {
 struct TxnState {
     xid: u32,
     records: Vec<CdcRecord>,
+    spill_file: Option<SpillFile>,
+    total_records: usize,
+    total_bytes: usize,
 }
 
 struct CdcState<'a> {
     relation_cache: RelationCache,
     table_buffers: HashMap<String, TableBuffer>,
     current_txn: Option<TxnState>,
+    /// Per-xid state for streaming transactions (protocol v2, PG14+).
+    /// Multiple streaming transactions can exist concurrently.
+    streaming_txns: HashMap<u32, TxnState>,
+    /// The xid of the currently active streaming segment (between StreamStart/StreamStop).
+    /// When Some, data messages are routed to this streaming transaction.
+    current_streaming_xid: Option<u32>,
     last_flush: Instant,
     total_buffered_rows: usize,
     total_buffered_bytes: usize,
@@ -77,6 +87,7 @@ struct CdcState<'a> {
     staging_root: &'a Path,
     config: &'a WalCaptureConfig,
     next_seq: i64,
+    max_txn_records: usize,
 }
 
 impl<'a> CdcState<'a> {
@@ -90,6 +101,8 @@ impl<'a> CdcState<'a> {
             relation_cache: RelationCache::new(),
             table_buffers: HashMap::new(),
             current_txn: None,
+            streaming_txns: HashMap::new(),
+            current_streaming_xid: None,
             last_flush: Instant::now(),
             total_buffered_rows: 0,
             total_buffered_bytes: 0,
@@ -98,6 +111,7 @@ impl<'a> CdcState<'a> {
             staging_root,
             config,
             next_seq: 0,
+            max_txn_records: 0,
         }
     }
 
@@ -105,25 +119,63 @@ impl<'a> CdcState<'a> {
         self.current_txn = Some(TxnState {
             xid,
             records: Vec::new(),
+            spill_file: None,
+            total_records: 0,
+            total_bytes: 0,
         });
     }
 
-    fn handle_commit(&mut self, end_lsn: Lsn, commit_ts: i64) {
+    async fn handle_commit(&mut self, end_lsn: Lsn, commit_ts: i64) -> anyhow::Result<()> {
         if let Some(txn) = self.current_txn.take() {
-            tracing::trace!(xid = txn.xid, records = txn.records.len(), "Commit");
-            for mut record in txn.records {
-                record.commit_lsn = end_lsn;
-                record.commit_ts = commit_ts;
-                record.seq = self.next_seq;
-                self.next_seq += 1;
-                let key = format!("{}.{}", record.table_schema, record.table_name);
-                self.total_buffered_rows += 1;
-                self.total_buffered_bytes += record.estimated_bytes;
-                self.table_buffers
-                    .entry(key)
-                    .or_insert_with(TableBuffer::new)
-                    .push(record);
+            let total_records = txn.total_records;
+            tracing::trace!(xid = txn.xid, records = total_records, "Commit");
+
+            // Track largest transaction for monitoring
+            if total_records > self.max_txn_records {
+                self.max_txn_records = total_records;
+                metrics::gauge!("walrus_cdc_txn_max_records").set(total_records as f64);
             }
+
+            if let Some(spill_file) = txn.spill_file {
+                // Spilled transaction: read back from disk in chunks
+                metrics::counter!("walrus_cdc_txn_spill_bytes_total")
+                    .increment(txn.total_bytes as u64);
+
+                let mut reader = spill_file.into_reader()?;
+                loop {
+                    let chunk = reader.read_chunk(SPILL_CHUNK_SIZE)?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    self.apply_committed_records(chunk, end_lsn, commit_ts);
+
+                    // Flush between chunks to keep memory bounded
+                    if self.should_flush() {
+                        self.flush().await?;
+                    }
+                }
+                // reader dropped here -> spill file deleted
+            } else {
+                // Normal in-memory transaction (unchanged fast path)
+                self.apply_committed_records(txn.records, end_lsn, commit_ts);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_committed_records(&mut self, records: Vec<CdcRecord>, end_lsn: Lsn, commit_ts: i64) {
+        for mut record in records {
+            record.commit_lsn = end_lsn;
+            record.commit_ts = commit_ts;
+            record.seq = self.next_seq;
+            self.next_seq += 1;
+            let key = format!("{}.{}", record.table_schema, record.table_name);
+            self.total_buffered_rows += 1;
+            self.total_buffered_bytes += record.estimated_bytes;
+            self.table_buffers
+                .entry(key)
+                .or_insert_with(TableBuffer::new)
+                .push(record);
         }
     }
 
@@ -138,41 +190,158 @@ impl<'a> CdcState<'a> {
     }
 
     async fn handle_insert(&mut self, relation_oid: u32, tuple: &TupleData) -> anyhow::Result<()> {
-        let Some(ref mut txn) = self.current_txn else {
-            return Ok(());
-        };
         let Some(rel) = self.relation_cache.get(relation_oid) else {
             return Ok(());
         };
         if rel.name == "awsdms_ddl_audit" {
             handle_ddl_insert(tuple, rel, self.metadata).await?;
+            return Ok(());
+        }
+        let record = tuple_to_cdc_record(rel, CdcOp::Insert, tuple, Lsn::ZERO, 0);
+        self.push_txn_record(record)
+    }
+
+    fn handle_update(&mut self, relation_oid: u32, new_tuple: &TupleData) -> anyhow::Result<()> {
+        let Some(rel) = self.relation_cache.get(relation_oid) else {
+            return Ok(());
+        };
+        let record = tuple_to_cdc_record(rel, CdcOp::Update, new_tuple, Lsn::ZERO, 0);
+        self.push_txn_record(record)
+    }
+
+    fn handle_delete(&mut self, relation_oid: u32, old_tuple: &TupleData) -> anyhow::Result<()> {
+        let Some(rel) = self.relation_cache.get(relation_oid) else {
+            return Ok(());
+        };
+        let record = tuple_to_cdc_record(rel, CdcOp::Delete, old_tuple, Lsn::ZERO, 0);
+        self.push_txn_record(record)
+    }
+
+    /// Push a record into the active transaction (regular or streaming),
+    /// spilling to disk if the memory threshold is exceeded.
+    fn push_txn_record(&mut self, record: CdcRecord) -> anyhow::Result<()> {
+        // Route to streaming transaction if inside a Stream Start/Stop block
+        let txn = if let Some(xid) = self.current_streaming_xid {
+            self.streaming_txns.get_mut(&xid)
         } else {
-            let record = tuple_to_cdc_record(rel, CdcOp::Insert, tuple, Lsn::ZERO, 0);
+            self.current_txn.as_mut()
+        };
+
+        let Some(txn) = txn else {
+            return Ok(());
+        };
+        let max_mem = self.config.max_txn_memory_bytes;
+        txn.total_bytes += record.estimated_bytes;
+        txn.total_records += 1;
+
+        if max_mem > 0 && txn.total_bytes > max_mem {
+            if txn.spill_file.is_none() {
+                let mut spill = SpillFile::create(self.staging_root)?;
+                // Flush existing in-memory records to disk
+                spill.write_batch(&txn.records)?;
+                txn.records.clear();
+                txn.spill_file = Some(spill);
+                tracing::warn!(
+                    xid = txn.xid,
+                    bytes = txn.total_bytes,
+                    records = txn.total_records,
+                    "Transaction exceeded memory threshold, spilling to disk"
+                );
+                metrics::counter!("walrus_cdc_txn_spills_total").increment(1);
+            }
+            txn.spill_file.as_mut().unwrap().append(&record)?;
+        } else {
             txn.records.push(record);
         }
         Ok(())
     }
 
-    fn handle_update(&mut self, relation_oid: u32, new_tuple: &TupleData) {
-        let Some(ref mut txn) = self.current_txn else {
-            return;
-        };
-        let Some(rel) = self.relation_cache.get(relation_oid) else {
-            return;
-        };
-        let record = tuple_to_cdc_record(rel, CdcOp::Update, new_tuple, Lsn::ZERO, 0);
-        txn.records.push(record);
+    // ── Protocol v2 streaming handlers (PG14+) ──
+
+    fn handle_stream_start(&mut self, xid: u32, first_segment: bool) {
+        if first_segment {
+            self.streaming_txns.insert(
+                xid,
+                TxnState {
+                    xid,
+                    records: Vec::new(),
+                    spill_file: None,
+                    total_records: 0,
+                    total_bytes: 0,
+                },
+            );
+            tracing::trace!(xid, "Stream start (first segment)");
+        } else {
+            tracing::trace!(xid, "Stream start (continuation)");
+        }
+        self.current_streaming_xid = Some(xid);
     }
 
-    fn handle_delete(&mut self, relation_oid: u32, old_tuple: &TupleData) {
-        let Some(ref mut txn) = self.current_txn else {
-            return;
-        };
-        let Some(rel) = self.relation_cache.get(relation_oid) else {
-            return;
-        };
-        let record = tuple_to_cdc_record(rel, CdcOp::Delete, old_tuple, Lsn::ZERO, 0);
-        txn.records.push(record);
+    fn handle_stream_stop(&mut self) {
+        if let Some(xid) = self.current_streaming_xid.take() {
+            tracing::trace!(xid, "Stream stop");
+        }
+    }
+
+    async fn handle_stream_commit(
+        &mut self,
+        xid: u32,
+        end_lsn: Lsn,
+        commit_ts: i64,
+    ) -> anyhow::Result<()> {
+        // Clear streaming xid in case commit arrives without a preceding stop
+        if self.current_streaming_xid == Some(xid) {
+            self.current_streaming_xid = None;
+        }
+
+        if let Some(txn) = self.streaming_txns.remove(&xid) {
+            let total_records = txn.total_records;
+            tracing::debug!(xid, records = total_records, "Stream commit");
+
+            if total_records > self.max_txn_records {
+                self.max_txn_records = total_records;
+                metrics::gauge!("walrus_cdc_txn_max_records").set(total_records as f64);
+            }
+
+            if let Some(spill_file) = txn.spill_file {
+                metrics::counter!("walrus_cdc_txn_spill_bytes_total")
+                    .increment(txn.total_bytes as u64);
+
+                let mut reader = spill_file.into_reader()?;
+                loop {
+                    let chunk = reader.read_chunk(SPILL_CHUNK_SIZE)?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    self.apply_committed_records(chunk, end_lsn, commit_ts);
+
+                    if self.should_flush() {
+                        self.flush().await?;
+                    }
+                }
+            } else {
+                self.apply_committed_records(txn.records, end_lsn, commit_ts);
+            }
+
+            metrics::counter!("walrus_cdc_stream_commits_total").increment(1);
+        }
+        Ok(())
+    }
+
+    fn handle_stream_abort(&mut self, xid: u32) {
+        if self.current_streaming_xid == Some(xid) {
+            self.current_streaming_xid = None;
+        }
+        if let Some(txn) = self.streaming_txns.remove(&xid) {
+            tracing::debug!(
+                xid,
+                records = txn.total_records,
+                bytes = txn.total_bytes,
+                "Stream abort — discarding records"
+            );
+            metrics::counter!("walrus_cdc_stream_aborts_total").increment(1);
+            // TxnState dropped here; SpillFile's Drop cleans up the temp file
+        }
     }
 
     fn should_flush(&self) -> bool {
@@ -255,12 +424,14 @@ pub async fn run_cdc_loop(
         status_interval: std::time::Duration::from_secs(params.config.idle_timeout_seconds),
         idle_wakeup_interval: std::time::Duration::from_secs(params.config.idle_timeout_seconds),
         buffer_events: 8192,
+        streaming: params.config.streaming,
     };
 
     tracing::info!(
         start_lsn = %start_lsn,
         slot = slot_name,
         tls_mode = ?source.tls_mode,
+        streaming = params.config.streaming,
         "Starting CDC loop"
     );
 
@@ -299,7 +470,7 @@ pub async fn run_cdc_loop(
                     PgOutputMessage::Commit {
                         end_lsn, commit_ts, ..
                     } => {
-                        state.handle_commit(end_lsn, commit_ts);
+                        state.handle_commit(end_lsn, commit_ts).await?;
                         client.update_applied_lsn(
                             pgwire_replication::Lsn::parse(&Lsn(wal_end.into()).to_string())
                                 .unwrap_or(repl_lsn),
@@ -325,15 +496,38 @@ pub async fn run_cdc_loop(
                         new_tuple,
                         ..
                     } => {
-                        state.handle_update(relation_oid, &new_tuple);
+                        state.handle_update(relation_oid, &new_tuple)?;
                         metrics::counter!("walrus_cdc_rows_total", "op" => "update").increment(1);
                     }
                     PgOutputMessage::Delete {
                         relation_oid,
                         old_tuple,
                     } => {
-                        state.handle_delete(relation_oid, &old_tuple);
+                        state.handle_delete(relation_oid, &old_tuple)?;
                         metrics::counter!("walrus_cdc_rows_total", "op" => "delete").increment(1);
+                    }
+                    // Protocol v2 streaming messages (PG14+)
+                    PgOutputMessage::StreamStart { xid, first_segment } => {
+                        state.handle_stream_start(xid, first_segment);
+                    }
+                    PgOutputMessage::StreamStop => {
+                        state.handle_stream_stop();
+                    }
+                    PgOutputMessage::StreamCommit {
+                        xid,
+                        end_lsn,
+                        commit_ts,
+                        ..
+                    } => {
+                        state.handle_stream_commit(xid, end_lsn, commit_ts).await?;
+                        client.update_applied_lsn(
+                            pgwire_replication::Lsn::parse(&Lsn(wal_end.into()).to_string())
+                                .unwrap_or(repl_lsn),
+                        );
+                        metrics::counter!("walrus_cdc_commits_total").increment(1);
+                    }
+                    PgOutputMessage::StreamAbort { xid, .. } => {
+                        state.handle_stream_abort(xid);
                     }
                     _ => {}
                 }

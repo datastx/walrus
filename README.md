@@ -49,6 +49,27 @@ Changes from the WAL stream (inserts, updates, deletes) are buffered in memory p
 
 Each flush atomically writes the Parquet file, enqueues it in the file queue, and advances the replication slot's checkpoint. This ordering guarantees that the slot is never advanced past data that hasn't been safely staged.
 
+#### Handling Large Transactions
+
+A single PostgreSQL transaction that touches millions of rows creates three related problems: unbounded memory growth on the consumer, WAL retention bloat on the source (the slot's [`restart_lsn`](https://www.postgresql.org/docs/current/view-pg-replication-slots.html) is pinned until the transaction commits), and a latency spike when all the changes are delivered in a burst at commit time. These are well-documented challenges in the CDC space -- [PeerDB](https://blog.peerdb.io/handling-initial-snapshots-for-large-tables-in-postgres-cdc), [Debezium](https://debezium.io/documentation/reference/stable/connectors/postgresql.html#postgresql-wal-disk-space), and [CockroachDB changefeeds](https://www.cockroachlabs.com/docs/stable/create-changefeed#memory-usage) all have mechanisms to address them.
+
+Walrus tackles this from two angles:
+
+**Transaction spill-to-disk.** When an in-flight transaction's in-memory buffer exceeds a configurable threshold (`max_txn_memory_bytes`, default 128 MB), Walrus spills the buffered records to a temporary file on disk and continues appending there. On commit, records are read back in chunks and flushed to table buffers incrementally so memory stays bounded throughout. On abort, the spill file is cleaned up automatically. This approach is similar to how PostgreSQL's own [`logical_decoding_work_mem`](https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-LOGICAL-DECODING-WORK-MEM) works server-side -- when the ReorderBuffer exceeds the configured memory limit, decoded changes are [spilled to disk](https://www.postgresql.org/docs/current/logicaldecoding-output-plugin.html) under the `pg_replslot/` directory. Walrus applies the same principle on the consumer side, which works regardless of PostgreSQL version.
+
+**pgoutput protocol v2 streaming (PostgreSQL 14+).** PostgreSQL 14 introduced [streaming mode for logical replication](https://www.postgresql.org/docs/current/logical-replication-config.html) (`streaming = on`). Instead of buffering an entire large transaction server-side until commit, the server begins sending in-progress transaction changes incrementally once `logical_decoding_work_mem` is exceeded. This is controlled by the [pgoutput protocol version 2](https://www.postgresql.org/docs/current/protocol-logicalrep-message-formats.html), which adds four new message types: Stream Start, Stream Stop, Stream Commit, and Stream Abort. Walrus includes a vendored fork of `pgwire-replication` that negotiates protocol v2 and passes `streaming 'on'` when this feature is enabled. The WAL Capture service maintains per-transaction state for each streamed xid (using the same spill-to-disk infrastructure for memory safety) and only materializes the records into table buffers on Stream Commit.
+
+When streaming is enabled, the server-side benefits are significant: the [`ReorderBuffer`](https://www.postgresql.org/docs/current/reorder-buffer.html) no longer needs to hold the full transaction in memory or on disk, WAL segments are released earlier because the slot's restart LSN can advance during the transaction, and the "dam burst" latency spike at commit time is eliminated because data arrives incrementally. PostgreSQL 16 extended this further with [`streaming = parallel`](https://www.postgresql.org/docs/16/logical-replication-config.html), which applies streamed transactions in parallel workers for a reported 50-60% throughput improvement, though Walrus does not yet distinguish between the two modes.
+
+To enable streaming, set `streaming = true` in the WAL Capture configuration (or the `CDC_STREAMING` environment variable). This requires PostgreSQL 14 or later. On older versions, leave streaming disabled -- the spill-to-disk mechanism still protects against OOM.
+
+**Source-side guardrails.** Independent of the above, the source PostgreSQL should be configured to limit the blast radius of large transactions:
+
+- [`max_slot_wal_keep_size`](https://www.postgresql.org/docs/current/runtime-config-replication.html#GUC-MAX-SLOT-WAL-KEEP-SIZE) (PG13+) caps WAL retention per slot. If exceeded, the slot is invalidated rather than letting disk fill up.
+- [`statement_timeout`](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-STATEMENT-TIMEOUT) and [`idle_in_transaction_session_timeout`](https://www.postgresql.org/docs/current/runtime-config-client.html#GUC-IDLE-IN-TRANSACTION-SESSION-TIMEOUT) limit runaway statements and abandoned transactions.
+- [`logical_decoding_work_mem`](https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-LOGICAL-DECODING-WORK-MEM) controls when the server spills to disk (default 64 MB). Raising this reduces disk I/O but increases memory usage.
+- Monitoring `pg_stat_replication.write_lag` and `pg_replication_slots.wal_status` provides early warning of replication lag and WAL accumulation.
+
 ### Phase 3: Iceberg Merge
 
 The Iceberg Writer polls the file queue for pending work. For each batch of files:
@@ -129,13 +150,15 @@ The two services share a filesystem directory (a Kubernetes PersistentVolumeClai
 │       ├── 0.parquet
 │       ├── 1.parquet
 │       └── ...
-└── cdc/
-    └── <schema>.<table>/
-        ├── <batch-uuid>.parquet
-        └── ...
+├── cdc/
+│   └── <schema>.<table>/
+│       ├── <batch-uuid>.parquet
+│       └── ...
+└── spill/
+    └── spill_<uuid>.tmp   (temporary, auto-cleaned)
 ```
 
-WAL Capture writes files here. Iceberg Writer reads them. Completed files are cleaned up after a configurable retention period.
+WAL Capture writes files here. Iceberg Writer reads them. Completed files are cleaned up after a configurable retention period. The `spill/` directory holds temporary files for large transactions that exceed the in-memory threshold; these are automatically deleted on transaction commit or abort.
 
 ---
 
@@ -177,6 +200,8 @@ Key settings:
 | Flush row threshold | CDC rows before flush | 50,000 |
 | Flush byte threshold | CDC buffer bytes before flush | 64 MB |
 | Flush time threshold | Seconds before time-based flush | 30 |
+| Max txn memory | In-flight transaction bytes before spilling to disk | 128 MB |
+| Streaming | Enable pgoutput v2 streaming for large transactions (PG14+) | false |
 | Backfill parallelism | Concurrent tables during export | 4 |
 | Rows per partition | CTID range size for export chunks | 500,000 |
 | Warehouse path | Iceberg warehouse directory | /data/iceberg |

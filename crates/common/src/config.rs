@@ -113,6 +113,18 @@ pub struct WalCaptureConfig {
     #[serde(default = "default_idle_timeout_seconds")]
     pub idle_timeout_seconds: u64,
 
+    /// Memory threshold (bytes) before spilling an in-flight transaction to disk.
+    /// Prevents OOM from large transactions. Set to 0 to disable spilling.
+    #[serde(default = "default_max_txn_memory_bytes")]
+    pub max_txn_memory_bytes: usize,
+
+    /// Enable pgoutput protocol v2 streaming for large transactions.
+    /// Requires PostgreSQL 14+. When enabled, PG streams large in-progress
+    /// transactions incrementally instead of buffering until commit, reducing
+    /// WAL retention and server-side memory pressure.
+    #[serde(default)]
+    pub streaming: bool,
+
     #[serde(default = "default_health_port_capture")]
     pub health_port: u16,
 }
@@ -261,6 +273,14 @@ impl AppConfig {
                 config.wal_capture.rows_per_partition = n;
             }
         }
+        if let Ok(v) = std::env::var("MAX_TXN_MEMORY_BYTES") {
+            if let Ok(n) = v.parse() {
+                config.wal_capture.max_txn_memory_bytes = n;
+            }
+        }
+        if let Ok(v) = std::env::var("CDC_STREAMING") {
+            config.wal_capture.streaming = matches!(v.to_lowercase().as_str(), "true" | "1" | "on");
+        }
         if let Ok(v) = std::env::var("WAL_CAPTURE_HEALTH_PORT") {
             if let Ok(n) = v.parse() {
                 config.wal_capture.health_port = n;
@@ -305,6 +325,8 @@ impl Default for WalCaptureConfig {
             max_batch_bytes: default_max_batch_bytes(),
             flush_interval_seconds: default_flush_interval_seconds(),
             idle_timeout_seconds: default_idle_timeout_seconds(),
+            max_txn_memory_bytes: default_max_txn_memory_bytes(),
+            streaming: false,
             health_port: default_health_port_capture(),
         }
     }
@@ -372,6 +394,9 @@ fn default_compaction_threshold() -> u32 {
 }
 fn default_max_retries() -> i32 {
     3
+}
+fn default_max_txn_memory_bytes() -> usize {
+    128 * 1024 * 1024 // 128 MB
 }
 fn default_health_port_capture() -> u16 {
     8081
