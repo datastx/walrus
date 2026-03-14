@@ -220,6 +220,7 @@ fn replication_config(
         status_interval: Duration::from_secs(1),
         idle_wakeup_interval: Duration::from_secs(15),
         buffer_events: 2048,
+        streaming: false,
     }
 }
 
@@ -924,6 +925,7 @@ host    replication     all             ::/0                    scram-sha-256
         status_interval: Duration::from_secs(1),
         idle_wakeup_interval: Duration::from_secs(15),
         buffer_events: 1024,
+        streaming: false,
     };
 
     let mut repl = ReplicationClient::connect(config)
@@ -1138,6 +1140,7 @@ async fn postgres_replication_tls() -> Result<()> {
         status_interval: Duration::from_secs(1),
         idle_wakeup_interval: Duration::from_secs(15),
         buffer_events: 1024,
+        streaming: false,
     };
 
     info!("TLS connection successful, waiting for keepalive");
@@ -1283,6 +1286,7 @@ async fn postgres_replication_tls_require_mode() -> Result<()> {
         status_interval: Duration::from_secs(1),
         idle_wakeup_interval: Duration::from_secs(15),
         buffer_events: 1024,
+        streaming: false,
     };
 
     let mut repl = ReplicationClient::connect(config)
@@ -1431,6 +1435,7 @@ async fn postgres_replication_tls_wrong_ca_fails() -> Result<()> {
         status_interval: Duration::from_secs(1),
         idle_wakeup_interval: Duration::from_secs(15),
         buffer_events: 1024,
+        streaming: false,
     };
 
     let result = ReplicationClient::connect(config).await;
