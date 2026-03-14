@@ -187,6 +187,10 @@ fn cdc_records_to_batch(
     let timestamps: Vec<i64> = records.iter().map(|r| r.commit_ts).collect();
     columns.push(Arc::new(Int64Array::from(timestamps)));
 
+    // _pgiceberg_seq
+    let seqs: Vec<i64> = records.iter().map(|r| r.seq).collect();
+    columns.push(Arc::new(Int64Array::from(seqs)));
+
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
@@ -259,3 +263,7 @@ fn default_writer_properties() -> WriterProperties {
         .set_max_row_group_size(100_000)
         .build()
 }
+
+#[cfg(test)]
+#[path = "parquet_writer_test.rs"]
+mod parquet_writer_test;

@@ -60,7 +60,8 @@ fn test_pg_type_name_to_iceberg() {
 #[test]
 fn test_cdc_metadata_fields() {
     let fields = cdc_metadata_fields();
-    assert_eq!(fields.len(), 2);
+    assert_eq!(fields.len(), 3);
     assert_eq!(fields[0].name(), "_pgiceberg_op");
     assert_eq!(fields[1].name(), "_pgiceberg_ts");
+    assert_eq!(fields[2].name(), "_pgiceberg_seq");
 }

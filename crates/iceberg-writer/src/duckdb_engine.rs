@@ -41,7 +41,7 @@ impl DuckDbEngine {
         let sql = format!(
             "CREATE OR REPLACE TABLE deduped AS \
              WITH ranked AS ( \
-               SELECT *, ROW_NUMBER() OVER (PARTITION BY {} ORDER BY _pgiceberg_ts DESC) AS rn \
+               SELECT *, ROW_NUMBER() OVER (PARTITION BY {} ORDER BY _pgiceberg_ts DESC, _pgiceberg_seq DESC) AS rn \
                FROM staged \
              ) \
              SELECT * EXCLUDE (rn) FROM ranked WHERE rn = 1",
@@ -57,13 +57,13 @@ impl DuckDbEngine {
 
         self.conn.execute_batch(
             "CREATE OR REPLACE TABLE to_upsert AS \
-             SELECT * EXCLUDE (_pgiceberg_op, _pgiceberg_ts) \
+             SELECT * EXCLUDE (_pgiceberg_op, _pgiceberg_ts, _pgiceberg_seq) \
              FROM deduped WHERE _pgiceberg_op IN ('I', 'U')",
         )?;
 
         let sql = format!(
             "CREATE OR REPLACE TABLE delete_keys AS \
-             SELECT {} FROM deduped WHERE _pgiceberg_op IN ('U', 'D')",
+             SELECT {} FROM deduped",
             pk_csv
         );
         self.conn.execute_batch(&sql)?;
@@ -118,3 +118,7 @@ impl DuckDbEngine {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "duckdb_engine_test.rs"]
+mod duckdb_engine_test;
