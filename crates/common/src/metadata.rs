@@ -344,7 +344,19 @@ impl MetadataStore {
                    SELECT table_schema, table_name \
                    FROM _pgiceberg.file_queue fq \
                    JOIN _pgiceberg.table_state ts USING (table_schema, table_name) \
-                   WHERE fq.status = 'pending' AND ts.phase = 'streaming' \
+                   WHERE fq.status = 'pending' \
+                     AND ( \
+                       (fq.file_type = 'backfill' AND ts.phase IN ('backfilling', 'streaming')) \
+                       OR \
+                       (fq.file_type != 'backfill' AND ts.phase = 'streaming' \
+                        AND NOT EXISTS ( \
+                          SELECT 1 FROM _pgiceberg.file_queue bf \
+                          WHERE bf.table_schema = fq.table_schema \
+                            AND bf.table_name = fq.table_name \
+                            AND bf.file_type = 'backfill' \
+                            AND bf.status NOT IN ('completed', 'deleted', 'failed') \
+                        )) \
+                     ) \
                    ORDER BY fq.created_at \
                    LIMIT 1 \
                  ) \
@@ -404,6 +416,28 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Mark files as permanently failed (max retries exceeded).
+    /// These files will not be retried.
+    pub async fn mark_files_permanently_failed(
+        &self,
+        file_ids: &[Uuid],
+        error: &str,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE _pgiceberg.file_queue \
+                 SET status = 'failed', \
+                     error_message = $2, \
+                     completed_at = now(), \
+                     processing_started = NULL \
+                 WHERE file_id = ANY($1)",
+                &[&file_ids, &error],
+            )
+            .await?;
+        Ok(())
+    }
+
     /// On startup recovery: reclaim files stuck in 'processing' for > 10 min.
     pub async fn reclaim_stale_processing(&self) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
@@ -437,6 +471,60 @@ impl MetadataStore {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
+    /// Delete replication state for a slot (used during re-bootstrap).
+    pub async fn delete_replication_state(&self, slot_name: &str) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM _pgiceberg.replication_state WHERE slot_name = $1",
+                &[&slot_name],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Reset tables for re-bootstrap: set backfilling tables back to pending,
+    /// clear their progress, and delete stale backfill file_queue entries.
+    pub async fn reset_tables_for_rebootstrap(&self) -> anyhow::Result<()> {
+        let mut client = self.pool.get().await?;
+        let txn = client.transaction().await?;
+
+        // Reset backfilling tables to pending
+        txn.execute(
+            "UPDATE _pgiceberg.table_state \
+             SET phase = 'pending', \
+                 backfill_done_partitions = 0, \
+                 backfill_snapshot_name = NULL, \
+                 updated_at = now() \
+             WHERE phase = 'backfilling'",
+            &[],
+        )
+        .await?;
+
+        // Delete pending/processing backfill file queue entries (stale)
+        txn.execute(
+            "DELETE FROM _pgiceberg.file_queue \
+             WHERE file_type = 'backfill' AND status IN ('pending', 'processing')",
+            &[],
+        )
+        .await?;
+
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Return all tracked file paths (not yet deleted) for orphan detection.
+    pub async fn get_all_tracked_file_paths(&self) -> anyhow::Result<Vec<String>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT file_path FROM _pgiceberg.file_queue WHERE status != 'deleted'",
+                &[],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
     // ── ddl_events ────────────────────────────────────────────────
 
     pub async fn insert_ddl_event(
@@ -444,15 +532,22 @@ impl MetadataStore {
         source_txn: Option<&str>,
         ddl_tag: &str,
         target_schema: &str,
+        target_table: &str,
         ddl_sql: &str,
     ) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
                 "INSERT INTO _pgiceberg.ddl_events \
-                 (source_txn, ddl_tag, target_schema, ddl_sql) \
-                 VALUES ($1, $2, $3, $4)",
-                &[&source_txn, &ddl_tag, &target_schema, &ddl_sql],
+                 (source_txn, ddl_tag, target_schema, target_table, ddl_sql) \
+                 VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &source_txn,
+                    &ddl_tag,
+                    &target_schema,
+                    &target_table,
+                    &ddl_sql,
+                ],
             )
             .await?;
         Ok(())
@@ -462,7 +557,7 @@ impl MetadataStore {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT event_id, source_txn, ddl_tag, target_schema, ddl_sql, \
+                "SELECT event_id, source_txn, ddl_tag, target_schema, target_table, ddl_sql, \
                  applied_to_iceberg \
                  FROM _pgiceberg.ddl_events \
                  WHERE applied_to_iceberg = FALSE \
@@ -477,8 +572,9 @@ impl MetadataStore {
                 source_txn: r.get(1),
                 ddl_tag: r.get(2),
                 target_schema: r.get(3),
-                ddl_sql: r.get(4),
-                applied_to_iceberg: r.get(5),
+                target_table: r.get(4),
+                ddl_sql: r.get(5),
+                applied_to_iceberg: r.get(6),
             })
             .collect())
     }
@@ -623,10 +719,14 @@ CREATE TABLE IF NOT EXISTS _pgiceberg.ddl_events (
     source_txn          TEXT,
     ddl_tag             TEXT NOT NULL,
     target_schema       TEXT NOT NULL,
+    target_table        TEXT NOT NULL DEFAULT '',
     ddl_sql             TEXT NOT NULL,
     captured_at         TIMESTAMPTZ DEFAULT now(),
     applied_to_iceberg  BOOLEAN DEFAULT FALSE,
     applied_at          TIMESTAMPTZ,
     error_message       TEXT
 );
+
+-- Idempotent migration for existing installations
+ALTER TABLE _pgiceberg.ddl_events ADD COLUMN IF NOT EXISTS target_table TEXT NOT NULL DEFAULT '';
 "#;

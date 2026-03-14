@@ -139,6 +139,7 @@ pub struct DdlEvent {
     pub source_txn: Option<String>,
     pub ddl_tag: String,
     pub target_schema: String,
+    pub target_table: String,
     pub ddl_sql: String,
     pub applied_to_iceberg: bool,
 }

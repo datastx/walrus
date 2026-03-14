@@ -380,13 +380,14 @@ async fn handle_ddl_insert(
 
     let txn = get_text(3);
     let tag = get_text(4).unwrap_or_default();
+    let table_name = get_text(6).unwrap_or_default();
     let schema = get_text(7).unwrap_or_else(|| "public".to_string());
     let ddl_sql = get_text(8).unwrap_or_default();
 
     if !tag.is_empty() {
-        tracing::info!(tag = %tag, schema = %schema, "Captured DDL event from WAL");
+        tracing::info!(tag = %tag, schema = %schema, table = %table_name, "Captured DDL event from WAL");
         metadata
-            .insert_ddl_event(txn.as_deref(), &tag, &schema, &ddl_sql)
+            .insert_ddl_event(txn.as_deref(), &tag, &schema, &table_name, &ddl_sql)
             .await?;
     }
     Ok(())

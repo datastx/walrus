@@ -74,6 +74,32 @@ pub async fn bootstrap(
     Ok(Some(slot_info))
 }
 
+/// Drop a replication slot. Used for recovery when the snapshot has expired.
+pub async fn drop_replication_slot(config: &SourceConfig) -> anyhow::Result<()> {
+    let (client, conn) = tokio_postgres::connect(&config.connection_string(), NoTls).await?;
+    tokio::spawn(async move {
+        if let Err(e) = conn.await {
+            tracing::error!("drop_replication_slot connection error: {}", e);
+        }
+    });
+
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            &[&config.slot_name],
+        )
+        .await?
+        .get(0);
+
+    if exists {
+        client
+            .execute("SELECT pg_drop_replication_slot($1)", &[&config.slot_name])
+            .await?;
+        info!(slot = %config.slot_name, "Dropped stale replication slot");
+    }
+    Ok(())
+}
+
 async fn ensure_publication(client: &Client, config: &SourceConfig) -> anyhow::Result<()> {
     let exists: bool = client
         .query_one(
@@ -188,14 +214,27 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
             "CREATE OR REPLACE FUNCTION public.awsdms_intercept_ddl()
              RETURNS event_trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
              DECLARE _qry text;
+             DECLARE _tbl_name text;
+             DECLARE _tbl_schema text;
+             DECLARE _r record;
              BEGIN
                  IF (tg_tag = 'CREATE TABLE' OR tg_tag = 'ALTER TABLE' OR
                      tg_tag = 'DROP TABLE'   OR tg_tag = 'CREATE TABLE AS') THEN
                      SELECT current_query() INTO _qry;
+                     _tbl_name := '';
+                     _tbl_schema := current_schema;
+                     IF tg_tag != 'DROP TABLE' THEN
+                         FOR _r IN SELECT objid, schema_name, object_identity
+                                   FROM pg_event_trigger_ddl_commands() LOOP
+                             _tbl_name := split_part(_r.object_identity, '.', 2);
+                             _tbl_schema := _r.schema_name;
+                             EXIT;
+                         END LOOP;
+                     END IF;
                      INSERT INTO public.awsdms_ddl_audit
                      VALUES (default, current_timestamp, current_user,
                              cast(TXID_CURRENT() AS varchar(16)),
-                             tg_tag, 0, '', current_schema, _qry);
+                             tg_tag, 0, _tbl_name, _tbl_schema, _qry);
                      DELETE FROM public.awsdms_ddl_audit;
                  END IF;
              END;

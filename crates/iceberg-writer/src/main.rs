@@ -11,6 +11,7 @@ use pgiceberg_common::config::AppConfig;
 use pgiceberg_common::health::{serve_health, HealthState};
 use pgiceberg_common::metadata::MetadataStore;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::watch;
 use tracing::info;
 
@@ -76,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initialize Iceberg catalog
-    let iceberg_catalog = catalog::init_catalog(&config.iceberg_writer).await?;
+    let iceberg_catalog = Arc::new(catalog::init_catalog(&config.iceberg_writer).await?);
 
     // Ensure Iceberg tables exist for all configured source tables
     for (schema, table) in config.source.table_list() {
@@ -115,6 +116,9 @@ async fn main() -> anyhow::Result<()> {
     // Spawn compaction on a timer
     let compaction_interval = config.iceberg_writer.compaction_interval_hours;
     let compaction_threshold = config.iceberg_writer.compaction_delete_threshold;
+    let compaction_catalog = Arc::clone(&iceberg_catalog);
+    let compaction_metadata = metadata.clone();
+    let compaction_tables: Vec<(String, String)> = config.source.table_list();
     let compaction_shutdown = shutdown_rx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -125,10 +129,48 @@ async fn main() -> anyhow::Result<()> {
             if *compaction_shutdown.borrow() {
                 break;
             }
-            if let Err(e) =
-                compaction::maybe_run_compaction(compaction_interval, compaction_threshold).await
+            if let Err(e) = compaction::maybe_run_compaction(
+                &compaction_catalog,
+                &compaction_metadata,
+                &compaction_tables,
+                compaction_interval,
+                compaction_threshold,
+            )
+            .await
             {
                 tracing::warn!("Compaction error: {}", e);
+            }
+        }
+    });
+
+    // Spawn periodic cleanup of completed staging files
+    let cleanup_hours = config.staging.cleanup_after_hours;
+    let cleanup_metadata = metadata.clone();
+    let cleanup_staging_root = config.staging.root.clone();
+    let cleanup_shutdown = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let cleanup_secs = (cleanup_hours as u64 * 3600).max(600);
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(cleanup_secs));
+        loop {
+            interval.tick().await;
+            if *cleanup_shutdown.borrow() {
+                break;
+            }
+            match cleanup_metadata.cleanup_completed(cleanup_hours).await {
+                Ok(paths) => {
+                    for path in &paths {
+                        let full = cleanup_staging_root.join(path);
+                        if full.exists() {
+                            std::fs::remove_file(&full).ok();
+                        }
+                    }
+                    if !paths.is_empty() {
+                        tracing::info!(count = paths.len(), "Periodic cleanup of old staged files");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Periodic cleanup error: {}", e);
+                }
             }
         }
     });

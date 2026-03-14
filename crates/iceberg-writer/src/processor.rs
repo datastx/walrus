@@ -8,6 +8,7 @@ use pgiceberg_common::metadata::MetadataStore;
 use pgiceberg_common::models::FileQueueEntry;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -30,6 +31,8 @@ pub async fn run_processing_loop(
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let poll_interval = std::time::Duration::from_secs(writer_config.poll_interval_seconds);
+    let reclaim_interval = Duration::from_secs(300);
+    let mut last_reclaim = Instant::now();
 
     // Cache of table state (PK columns, loaded Iceberg table handles)
     let mut pk_cache: HashMap<String, Vec<String>> = HashMap::new();
@@ -40,8 +43,22 @@ pub async fn run_processing_loop(
             break;
         }
 
+        // Periodic reclaim of stale processing files
+        if last_reclaim.elapsed() >= reclaim_interval {
+            match metadata.reclaim_stale_processing().await {
+                Ok(count) if count > 0 => {
+                    info!(reclaimed = count, "Reclaimed stale processing files");
+                }
+                Err(e) => {
+                    warn!("Stale reclaim error: {}", e);
+                }
+                _ => {}
+            }
+            last_reclaim = Instant::now();
+        }
+
         // Step 1: Process any pending DDL events first
-        if let Err(e) = ddl_handler::process_ddl_events(metadata).await {
+        if let Err(e) = ddl_handler::process_ddl_events(metadata, catalog).await {
             warn!("DDL processing error: {}", e);
         }
 
@@ -112,11 +129,15 @@ pub async fn run_processing_loop(
                         error = %e,
                         "Batch failed permanently — max retries exceeded"
                     );
+                    metadata
+                        .mark_files_permanently_failed(&file_ids, &e.to_string())
+                        .await?;
+                } else {
+                    metadata
+                        .mark_files_failed(&file_ids, &e.to_string())
+                        .await?;
+                    warn!(table = %table_key, error = %e, "Batch failed — will retry");
                 }
-                metadata
-                    .mark_files_failed(&file_ids, &e.to_string())
-                    .await?;
-                warn!(table = %table_key, error = %e, "Batch failed — will retry");
             }
         }
     }
