@@ -69,11 +69,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Configure Postgres for logical replication
         run: |
-          PGPASSWORD=testpass psql -h localhost -p 5433 -U replicator -d testdb -c "
-            ALTER SYSTEM SET wal_level = logical;
-            ALTER SYSTEM SET max_replication_slots = 10;
-            ALTER SYSTEM SET max_wal_senders = 10;
-          "
+          PGPASSWORD=testpass psql -h localhost -p 5433 -U replicator -d testdb \
+            -c "ALTER SYSTEM SET wal_level = logical;" \
+            -c "ALTER SYSTEM SET max_replication_slots = 10;" \
+            -c "ALTER SYSTEM SET max_wal_senders = 10;"
           docker restart $(docker ps -q --filter "ancestor=postgres:16")
           sleep 5
       - run: cargo test --workspace --test '*' -- --test-threads=1
