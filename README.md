@@ -244,7 +244,7 @@ The source database needs:
 - `wal_level = logical`
 - At least one available replication slot and WAL sender
 - A user with `REPLICATION` privilege and `SELECT` on the replicated tables
-- Superuser (or `rds_superuser` on RDS) for creating the DDL event trigger
+- Superuser (or equivalent, e.g. `rds_superuser` on managed databases) for creating the DDL event trigger
 
 ---
 

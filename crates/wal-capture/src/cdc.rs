@@ -193,7 +193,7 @@ impl<'a> CdcState<'a> {
         let Some(rel) = self.relation_cache.get(relation_oid) else {
             return Ok(());
         };
-        if rel.name == "awsdms_ddl_audit" {
+        if rel.name == "walrus_ddl_audit" {
             handle_ddl_insert(tuple, rel, self.metadata).await?;
             return Ok(());
         }
