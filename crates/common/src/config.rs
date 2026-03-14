@@ -21,6 +21,9 @@ pub struct SourceConfig {
     /// Name of the env var that holds the password (not the password itself).
     #[serde(default = "default_password_env")]
     pub password_env: String,
+    /// Direct password override (set by env var processing, not config file).
+    #[serde(default)]
+    pub password_override: Option<String>,
     #[serde(default = "default_slot_name")]
     pub slot_name: String,
     #[serde(default = "default_publication_name")]
@@ -90,6 +93,9 @@ pub struct IcebergWriterConfig {
 
 impl SourceConfig {
     pub fn password(&self) -> String {
+        if let Some(ref pw) = self.password_override {
+            return pw.clone();
+        }
         std::env::var(&self.password_env).unwrap_or_default()
     }
 
@@ -151,8 +157,7 @@ impl AppConfig {
             config.source.user = v;
         }
         if let Ok(v) = std::env::var("PG_PASSWORD") {
-            std::env::set_var("PG_PASSWORD", &v);
-            config.source.password_env = "PG_PASSWORD".to_string();
+            config.source.password_override = Some(v);
         }
         if let Ok(v) = std::env::var("STAGING_ROOT") {
             config.staging.root = PathBuf::from(v);
@@ -250,58 +255,5 @@ fn default_health_port_writer() -> u16 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_minimal_config() {
-        let toml_str = r#"
-[source]
-host = "localhost"
-port = 5432
-database = "mydb"
-user = "repl"
-
-[staging]
-root = "/tmp/staging"
-"#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.source.host, "localhost");
-        assert_eq!(config.source.port, 5432);
-        assert_eq!(config.staging.root, PathBuf::from("/tmp/staging"));
-        assert_eq!(config.wal_capture.max_batch_rows, 50_000);
-        assert_eq!(config.wal_capture.max_batch_bytes, 64 * 1024 * 1024);
-        assert_eq!(config.wal_capture.flush_interval_seconds, 30);
-    }
-
-    #[test]
-    fn test_table_list_parsing() {
-        let toml_str = r#"
-[source]
-host = "localhost"
-port = 5432
-database = "mydb"
-user = "repl"
-
-[source.tables]
-"public.users" = {}
-"myschema.orders" = { pk = ["id"] }
-
-[staging]
-root = "/tmp/staging"
-"#;
-        let config: AppConfig = toml::from_str(toml_str).unwrap();
-        let tables = config.source.table_list();
-        assert_eq!(tables.len(), 2);
-        assert_eq!(config.source.pk_for_table("myschema", "orders"), vec!["id"]);
-    }
-
-    #[test]
-    fn test_default_values() {
-        let wc = WalCaptureConfig::default();
-        assert_eq!(wc.max_batch_rows, 50_000);
-        assert_eq!(wc.max_batch_bytes, 64 * 1024 * 1024);
-        assert_eq!(wc.flush_interval_seconds, 30);
-        assert_eq!(wc.max_parallel_tables, 4);
-    }
-}
+#[path = "config_test.rs"]
+mod config_test;

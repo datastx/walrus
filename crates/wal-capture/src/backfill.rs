@@ -1,7 +1,8 @@
 use crate::parquet_writer::write_rows_to_parquet;
 use pgiceberg_common::config::{SourceConfig, WalCaptureConfig};
-use pgiceberg_common::metadata::MetadataStore;
-use pgiceberg_common::models::{CtidPartition, TablePhase, TableState};
+use pgiceberg_common::metadata::{EnqueueFileParams, MetadataStore};
+use pgiceberg_common::models::{CtidPartition, FileType, TablePhase, TableState};
+use pgiceberg_common::sql::{quote_ident, validate_snapshot_name};
 use std::path::Path;
 use tokio_postgres::NoTls;
 use tracing::info;
@@ -124,7 +125,6 @@ async fn backfill_single_table(
         }
     });
 
-    // Get page statistics for partition calculation
     let row = client
         .query_one(
             "SELECT COALESCE(relpages, 0)::bigint, GREATEST(reltuples, 0)::float8 \
@@ -197,7 +197,8 @@ async fn backfill_partition(
         }
     });
 
-    // Use the snapshot for consistent reads
+    validate_snapshot_name(snapshot_name)?;
+
     client
         .batch_execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .await?;
@@ -205,12 +206,13 @@ async fn backfill_partition(
         .batch_execute(&format!("SET TRANSACTION SNAPSHOT '{}'", snapshot_name))
         .await?;
 
+    let quoted_table = format!("{}.{}", quote_ident(schema), quote_ident(table));
     let query = if partition.start_page == 0 && partition.end_page == 0 {
-        format!("SELECT * FROM {}.{} WHERE false", schema, table)
+        format!("SELECT * FROM {} WHERE false", quoted_table)
     } else {
         format!(
-            "SELECT * FROM {}.{} WHERE ctid >= '({},0)'::tid AND ctid < '({},0)'::tid",
-            schema, table, partition.start_page, partition.end_page
+            "SELECT * FROM {} WHERE ctid >= '({},0)'::tid AND ctid < '({},0)'::tid",
+            quoted_table, partition.start_page, partition.end_page
         )
     };
 
@@ -220,33 +222,30 @@ async fn backfill_partition(
 
     let row_count = rows.len() as i64;
 
-    // Write Parquet file
     let dir = staging_root
         .join("backfill")
         .join(format!("{}.{}", schema, table));
-    std::fs::create_dir_all(&dir)?;
     let file_path = dir.join(format!("{}.parquet", partition.id));
 
-    if !rows.is_empty() {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        std::fs::create_dir_all(&dir)?;
         write_rows_to_parquet(&rows, &file_path)?;
-    } else {
-        // Write an empty Parquet with schema only
-        write_rows_to_parquet(&rows, &file_path)?;
-    }
+        Ok(())
+    })
+    .await??;
 
-    // Enqueue the file
     let relative_path = format!("backfill/{}.{}/{}.parquet", schema, table, partition.id);
     metadata
-        .enqueue_file(
+        .enqueue_file(&EnqueueFileParams {
             schema,
             table,
-            "backfill",
-            &relative_path,
-            None,
-            None,
+            file_type: FileType::Backfill,
+            file_path: &relative_path,
+            lsn_low: None,
+            lsn_high: None,
             row_count,
-            Some(partition.id),
-        )
+            partition_id: Some(partition.id),
+        })
         .await?;
 
     let done = metadata.advance_backfill_partition(schema, table).await?;
@@ -264,77 +263,5 @@ async fn backfill_partition(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_partition_calculation_small_table() {
-        let partitions = calculate_ctid_partitions(10, 100.0, 500);
-        assert_eq!(partitions.len(), 2);
-        assert_eq!(
-            partitions[0],
-            CtidPartition {
-                id: 0,
-                start_page: 0,
-                end_page: 5
-            }
-        );
-        assert_eq!(
-            partitions[1],
-            CtidPartition {
-                id: 1,
-                start_page: 5,
-                end_page: 10
-            }
-        );
-    }
-
-    #[test]
-    fn test_partition_calculation_empty_table() {
-        let partitions = calculate_ctid_partitions(0, 0.0, 500);
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(
-            partitions[0],
-            CtidPartition {
-                id: 0,
-                start_page: 0,
-                end_page: 0
-            }
-        );
-    }
-
-    #[test]
-    fn test_partition_calculation_single_page() {
-        let partitions = calculate_ctid_partitions(1, 50.0, 500);
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(
-            partitions[0],
-            CtidPartition {
-                id: 0,
-                start_page: 0,
-                end_page: 1
-            }
-        );
-    }
-
-    #[test]
-    fn test_partition_calculation_exact_fit() {
-        let partitions = calculate_ctid_partitions(100, 100.0, 5000);
-        // 5000 rows / 100 rpp = 50 pages per partition → 2 partitions
-        assert_eq!(partitions.len(), 2);
-    }
-
-    #[test]
-    fn test_partition_calculation_large_table() {
-        let partitions = calculate_ctid_partitions(10000, 50.0, 500_000);
-        // 500000 / 50 = 10000 pages per partition → exactly 1 partition
-        assert_eq!(partitions.len(), 1);
-    }
-
-    #[test]
-    fn test_partition_calculation_zero_rows_per_page() {
-        let partitions = calculate_ctid_partitions(100, 0.0, 500);
-        // When rpp is 0, use entire table as one partition
-        assert_eq!(partitions.len(), 1);
-    }
-}
+#[path = "backfill_test.rs"]
+mod backfill_test;

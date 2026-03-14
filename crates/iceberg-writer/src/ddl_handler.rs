@@ -2,6 +2,9 @@ use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_catalog_sql::SqlCatalog;
 use pgiceberg_common::metadata::MetadataStore;
 use pgiceberg_common::models::DdlEvent;
+use sqlparser::ast::Statement;
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use tracing::{info, warn};
 
 /// Parsed column change from ALTER TABLE DDL.
@@ -163,66 +166,51 @@ async fn apply_drop_table(
     Ok(())
 }
 
-/// Parse ALTER TABLE SQL to extract structured column changes.
+/// Parse ALTER TABLE SQL to extract structured column changes using sqlparser.
 pub fn parse_alter_table(sql: &str) -> Vec<DdlColumnChange> {
-    let sql_upper = sql.to_uppercase();
+    let dialect = PostgreSqlDialect {};
+    let stmts = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        Err(_) => return vec![DdlColumnChange::Unparsed(sql.to_string())],
+    };
+
     let mut changes = Vec::new();
 
-    if sql_upper.contains("ADD COLUMN") {
-        if let Some(pos) = sql_upper.find("ADD COLUMN") {
-            let rest = &sql[pos + "ADD COLUMN".len()..].trim_start();
-            let tokens: Vec<&str> = rest.splitn(3, char::is_whitespace).collect();
-            if tokens.len() >= 2 {
-                let col_name = tokens[0].trim_matches('"');
-                let data_type = if tokens.len() >= 3 {
-                    format!("{} {}", tokens[1], tokens[2])
-                        .trim_end_matches(';')
-                        .trim()
-                        .to_string()
-                } else {
-                    tokens[1].trim_end_matches(';').to_string()
-                };
-                changes.push(DdlColumnChange::AddColumn {
-                    column_name: col_name.to_string(),
-                    data_type,
-                });
-            }
-        }
-    }
-
-    if sql_upper.contains("DROP COLUMN") {
-        if let Some(pos) = sql_upper.find("DROP COLUMN") {
-            let rest = &sql[pos + "DROP COLUMN".len()..].trim_start();
-            let col_name = rest
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .trim_matches('"')
-                .trim_end_matches(';');
-            if !col_name.is_empty() {
-                changes.push(DdlColumnChange::DropColumn {
-                    column_name: col_name.to_string(),
-                });
-            }
-        }
-    }
-
-    if sql_upper.contains("ALTER COLUMN") {
-        if let Some(pos) = sql_upper.find("ALTER COLUMN") {
-            let rest = &sql[pos + "ALTER COLUMN".len()..].trim_start();
-            let tokens: Vec<&str> = rest.split_whitespace().collect();
-            if !tokens.is_empty() {
-                let col_name = tokens[0].trim_matches('"');
-                let new_type = if let Some(type_pos) = sql_upper[pos..].find("TYPE") {
-                    let type_rest = &sql[pos + type_pos + "TYPE".len()..].trim_start();
-                    Some(type_rest.split(';').next().unwrap_or("").trim().to_string())
-                } else {
-                    None
-                };
-                changes.push(DdlColumnChange::AlterColumn {
-                    column_name: col_name.to_string(),
-                    new_type,
-                });
+    for stmt in stmts {
+        if let Statement::AlterTable { operations, .. } = stmt {
+            for op in operations {
+                use sqlparser::ast::AlterTableOperation;
+                match op {
+                    AlterTableOperation::AddColumn { column_def, .. } => {
+                        changes.push(DdlColumnChange::AddColumn {
+                            column_name: column_def.name.value.clone(),
+                            data_type: column_def.data_type.to_string(),
+                        });
+                    }
+                    AlterTableOperation::DropColumn { column_name, .. } => {
+                        changes.push(DdlColumnChange::DropColumn {
+                            column_name: column_name.value.clone(),
+                        });
+                    }
+                    AlterTableOperation::AlterColumn {
+                        column_name, op, ..
+                    } => {
+                        use sqlparser::ast::AlterColumnOperation;
+                        let new_type = match op {
+                            AlterColumnOperation::SetDataType { data_type, .. } => {
+                                Some(data_type.to_string())
+                            }
+                            _ => None,
+                        };
+                        changes.push(DdlColumnChange::AlterColumn {
+                            column_name: column_name.value.clone(),
+                            new_type,
+                        });
+                    }
+                    _ => {
+                        changes.push(DdlColumnChange::Unparsed(format!("{}", op)));
+                    }
+                }
             }
         }
     }
@@ -235,87 +223,5 @@ pub fn parse_alter_table(sql: &str) -> Vec<DdlColumnChange> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_add_column() {
-        let changes = parse_alter_table("ALTER TABLE users ADD COLUMN age INT");
-        assert_eq!(changes.len(), 1);
-        match &changes[0] {
-            DdlColumnChange::AddColumn {
-                column_name,
-                data_type,
-            } => {
-                assert_eq!(column_name, "age");
-                assert_eq!(data_type, "INT");
-            }
-            other => panic!("Expected AddColumn, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_add_column_with_type() {
-        let changes = parse_alter_table("ALTER TABLE users ADD COLUMN name varchar(255)");
-        assert_eq!(changes.len(), 1);
-        match &changes[0] {
-            DdlColumnChange::AddColumn {
-                column_name,
-                data_type,
-            } => {
-                assert_eq!(column_name, "name");
-                assert!(data_type.contains("varchar"));
-            }
-            other => panic!("Expected AddColumn, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_drop_column() {
-        let changes = parse_alter_table("ALTER TABLE users DROP COLUMN email");
-        assert_eq!(changes.len(), 1);
-        match &changes[0] {
-            DdlColumnChange::DropColumn { column_name } => {
-                assert_eq!(column_name, "email");
-            }
-            other => panic!("Expected DropColumn, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_alter_column_type() {
-        let changes = parse_alter_table("ALTER TABLE users ALTER COLUMN name TYPE varchar(255)");
-        assert_eq!(changes.len(), 1);
-        match &changes[0] {
-            DdlColumnChange::AlterColumn {
-                column_name,
-                new_type,
-            } => {
-                assert_eq!(column_name, "name");
-                assert!(new_type.as_ref().unwrap().contains("varchar"));
-            }
-            other => panic!("Expected AlterColumn, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_parse_unknown_alter() {
-        let changes = parse_alter_table("ALTER TABLE users RENAME TO customers");
-        assert_eq!(changes.len(), 1);
-        assert!(matches!(&changes[0], DdlColumnChange::Unparsed(_)));
-    }
-
-    #[test]
-    fn test_ddl_column_change_display() {
-        let add = DdlColumnChange::AddColumn {
-            column_name: "age".to_string(),
-            data_type: "INT".to_string(),
-        };
-        assert_eq!(add.to_string(), "ADD COLUMN age INT");
-
-        let drop = DdlColumnChange::DropColumn {
-            column_name: "email".to_string(),
-        };
-        assert_eq!(drop.to_string(), "DROP COLUMN email");
-    }
-}
+#[path = "ddl_handler_test.rs"]
+mod ddl_handler_test;

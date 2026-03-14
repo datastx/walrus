@@ -1,6 +1,8 @@
 use pgiceberg_common::config::SourceConfig;
+use pgiceberg_common::config::WalCaptureConfig;
 use pgiceberg_common::metadata::MetadataStore;
 use pgiceberg_common::models::TablePhase;
+use pgiceberg_common::sql::quote_ident;
 use tokio_postgres::{Client, NoTls};
 use tracing::{info, warn};
 
@@ -21,6 +23,7 @@ pub struct SlotInfo {
 ///     be persisted.  Config-supplied PKs override if present.
 pub async fn bootstrap(
     config: &SourceConfig,
+    wal_config: &WalCaptureConfig,
     metadata: &MetadataStore,
 ) -> anyhow::Result<Option<SlotInfo>> {
     metadata.bootstrap().await?;
@@ -57,7 +60,8 @@ pub async fn bootstrap(
 
     for (schema, table) in config.table_list() {
         let pk_cols = discover_or_config_pk(config, metadata, &schema, &table).await?;
-        let partitions = compute_partitions(&client, &schema, &table, config).await?;
+        let partitions =
+            compute_partitions(&client, &schema, &table, wal_config.rows_per_partition).await?;
         metadata
             .upsert_table_state(
                 &schema,
@@ -116,11 +120,11 @@ async fn ensure_publication(client: &Client, config: &SourceConfig) -> anyhow::R
         let table_list: Vec<String> = config
             .table_list()
             .iter()
-            .map(|(s, t)| format!("{}.{}", s, t))
+            .map(|(s, t)| format!("{}.{}", quote_ident(s), quote_ident(t)))
             .collect();
         let sql = format!(
             "CREATE PUBLICATION {} FOR TABLE {}",
-            config.publication_name,
+            quote_ident(&config.publication_name),
             table_list.join(", ")
         );
         client.batch_execute(&sql).await?;
@@ -143,8 +147,10 @@ async fn sync_publication_tables(client: &Client, config: &SourceConfig) -> anyh
         let full = format!("{}.{}", schema, table);
         if !current.contains(&full) {
             let sql = format!(
-                "ALTER PUBLICATION {} ADD TABLE {}",
-                config.publication_name, full
+                "ALTER PUBLICATION {} ADD TABLE {}.{}",
+                quote_ident(&config.publication_name),
+                quote_ident(&schema),
+                quote_ident(&table)
             );
             client.batch_execute(&sql).await?;
             info!(table = %full, "Added table to publication");
@@ -274,7 +280,7 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
     if !in_pub {
         let sql = format!(
             "ALTER PUBLICATION {} ADD TABLE public.awsdms_ddl_audit",
-            config.publication_name
+            quote_ident(&config.publication_name)
         );
         client.batch_execute(&sql).await?;
     }
@@ -286,7 +292,7 @@ async fn compute_partitions(
     client: &Client,
     schema: &str,
     table: &str,
-    config: &SourceConfig,
+    rows_per_partition: u64,
 ) -> anyhow::Result<u64> {
     let row = client
         .query_one(
@@ -307,11 +313,6 @@ async fn compute_partitions(
     }
 
     let rows_per_page = reltuples / relpages as f64;
-    let rows_per_partition = config
-        .tables
-        .get(&format!("{}.{}", schema, table))
-        .map(|_| ()) // just checking if it exists
-        .map_or(500_000u64, |_| 500_000);
 
     let pages_per_partition = if rows_per_page > 0.0 {
         (rows_per_partition as f64 / rows_per_page).ceil() as u64

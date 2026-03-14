@@ -61,6 +61,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
+# SQL parsing
+sqlparser = "0.55"
+
 # Error handling
 anyhow = "1"
 thiserror = "2"

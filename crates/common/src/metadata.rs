@@ -3,6 +3,27 @@ use deadpool_postgres::{Config, Pool, Runtime};
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
+pub struct EnqueueFileParams<'a> {
+    pub schema: &'a str,
+    pub table: &'a str,
+    pub file_type: FileType,
+    pub file_path: &'a str,
+    pub lsn_low: Option<&'a Lsn>,
+    pub lsn_high: Option<&'a Lsn>,
+    pub row_count: i64,
+    pub partition_id: Option<i32>,
+}
+
+pub struct EnqueueCdcFileParams<'a> {
+    pub slot_name: &'a str,
+    pub schema: &'a str,
+    pub table: &'a str,
+    pub file_path: &'a str,
+    pub lsn_low: &'a Lsn,
+    pub lsn_high: &'a Lsn,
+    pub row_count: i64,
+}
+
 /// Client for the `_pgiceberg` metadata schema in the source Postgres.
 ///
 /// All state that both services need to coordinate lives here.  On startup each
@@ -255,21 +276,11 @@ impl MetadataStore {
 
     // ── file_queue ────────────────────────────────────────────────
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn enqueue_file(
-        &self,
-        schema: &str,
-        table: &str,
-        file_type: &str,
-        file_path: &str,
-        lsn_low: Option<&Lsn>,
-        lsn_high: Option<&Lsn>,
-        row_count: i64,
-        partition_id: Option<i32>,
-    ) -> anyhow::Result<Uuid> {
+    pub async fn enqueue_file(&self, params: &EnqueueFileParams<'_>) -> anyhow::Result<Uuid> {
         let client = self.pool.get().await?;
-        let lsn_low_str = lsn_low.map(|l| l.to_string());
-        let lsn_high_str = lsn_high.map(|l| l.to_string());
+        let lsn_low_str = params.lsn_low.map(|l| l.to_string());
+        let lsn_high_str = params.lsn_high.map(|l| l.to_string());
+        let file_type_str = params.file_type.as_str();
         let row = client
             .query_one(
                 "INSERT INTO _pgiceberg.file_queue \
@@ -278,14 +289,14 @@ impl MetadataStore {
                  VALUES ($1, $2, $3, $4, $5::pg_lsn, $6::pg_lsn, $7, $8, 'pending') \
                  RETURNING file_id",
                 &[
-                    &schema,
-                    &table,
-                    &file_type,
-                    &file_path,
+                    &params.schema,
+                    &params.table,
+                    &file_type_str,
+                    &params.file_path,
                     &lsn_low_str,
                     &lsn_high_str,
-                    &row_count,
-                    &partition_id,
+                    &params.row_count,
+                    &params.partition_id,
                 ],
             )
             .await?;
@@ -293,33 +304,26 @@ impl MetadataStore {
     }
 
     /// Atomically enqueue a CDC file AND update the flushed LSN in one transaction.
-    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue_cdc_file_and_update_lsn(
         &self,
-        slot_name: &str,
-        schema: &str,
-        table: &str,
-        file_path: &str,
-        lsn_low: &Lsn,
-        lsn_high: &Lsn,
-        row_count: i64,
+        params: &EnqueueCdcFileParams<'_>,
     ) -> anyhow::Result<()> {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
-        let lsn_low_str = lsn_low.to_string();
-        let lsn_high_str = lsn_high.to_string();
+        let lsn_low_str = params.lsn_low.to_string();
+        let lsn_high_str = params.lsn_high.to_string();
         txn.execute(
             "INSERT INTO _pgiceberg.file_queue \
              (table_schema, table_name, file_type, file_path, \
               lsn_low, lsn_high, row_count, status) \
              VALUES ($1, $2, 'cdc_mixed', $3, $4::pg_lsn, $5::pg_lsn, $6, 'pending')",
             &[
-                &schema,
-                &table,
-                &file_path,
+                &params.schema,
+                &params.table,
+                &params.file_path,
                 &lsn_low_str,
                 &lsn_high_str,
-                &row_count,
+                &params.row_count,
             ],
         )
         .await?;
@@ -327,7 +331,7 @@ impl MetadataStore {
             "UPDATE _pgiceberg.replication_state \
              SET last_flushed_lsn = $2::pg_lsn, updated_at = now() \
              WHERE slot_name = $1",
-            &[&slot_name, &lsn_high_str],
+            &[&params.slot_name, &lsn_high_str],
         )
         .await?;
         txn.commit().await?;
@@ -646,7 +650,7 @@ impl MetadataStore {
             file_id: r.get(0),
             table_schema: r.get(1),
             table_name: r.get(2),
-            file_type: r.get(3),
+            file_type: r.get::<_, String>(3).parse().unwrap(),
             file_path: r.get(4),
             lsn_low: r
                 .get::<_, Option<String>>(5)

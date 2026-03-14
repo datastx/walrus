@@ -1,5 +1,5 @@
 .PHONY: build check test test-unit test-integration lint fmt fmt-check \
-       docker-build docker-up docker-down e2e clean help
+       docker-build docker-up docker-down e2e clean ci help
 
 CARGO := cargo
 DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
@@ -47,6 +47,8 @@ docker-down: ## Stop and remove all Docker Compose services and volumes
 
 e2e: ## Run full end-to-end test
 	bash scripts/run_local.sh
+
+ci: fmt-check lint test-unit build ## Run all CI checks locally
 
 clean: ## Clean build artifacts and Docker resources
 	$(CARGO) clean

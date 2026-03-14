@@ -1,3 +1,4 @@
+use crate::error::WalrusError;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -10,11 +11,15 @@ pub struct Lsn(pub u64);
 impl Lsn {
     pub const ZERO: Lsn = Lsn(0);
 
-    pub fn parse(s: &str) -> anyhow::Result<Self> {
+    pub fn parse(s: &str) -> Result<Self, WalrusError> {
         let parts: Vec<&str> = s.split('/').collect();
-        anyhow::ensure!(parts.len() == 2, "Invalid LSN format: {}", s);
-        let hi = u64::from_str_radix(parts[0], 16)?;
-        let lo = u64::from_str_radix(parts[1], 16)?;
+        if parts.len() != 2 {
+            return Err(WalrusError::InvalidLsn(s.to_string()));
+        }
+        let hi = u64::from_str_radix(parts[0], 16)
+            .map_err(|_| WalrusError::InvalidLsn(s.to_string()))?;
+        let lo = u64::from_str_radix(parts[1], 16)
+            .map_err(|_| WalrusError::InvalidLsn(s.to_string()))?;
         Ok(Lsn((hi << 32) | lo))
     }
 }
@@ -114,13 +119,45 @@ pub struct TableState {
     pub primary_key_columns: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileType {
+    Backfill,
+    CdcMixed,
+}
+
+impl FileType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FileType::Backfill => "backfill",
+            FileType::CdcMixed => "cdc_mixed",
+        }
+    }
+}
+
+impl std::fmt::Display for FileType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for FileType {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "backfill" => FileType::Backfill,
+            _ => FileType::CdcMixed,
+        })
+    }
+}
+
 /// Row from `_pgiceberg.file_queue`
 #[derive(Debug, Clone)]
 pub struct FileQueueEntry {
     pub file_id: Uuid,
     pub table_schema: String,
     pub table_name: String,
-    pub file_type: String,
+    pub file_type: FileType,
     pub file_path: String,
     pub lsn_low: Option<Lsn>,
     pub lsn_high: Option<Lsn>,
@@ -216,55 +253,5 @@ pub enum ReplicaIdentity {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lsn_parse_and_display() {
-        let lsn = Lsn::parse("0/16B6C50").unwrap();
-        assert_eq!(lsn.0, 0x16B6C50);
-        assert_eq!(lsn.to_string(), "0/16B6C50");
-
-        let lsn2 = Lsn::parse("16/B374D848").unwrap();
-        assert_eq!(lsn2.0, 0x16_B374D848);
-        assert_eq!(lsn2.to_string(), "16/B374D848");
-    }
-
-    #[test]
-    fn test_lsn_ordering() {
-        let a = Lsn::parse("0/100").unwrap();
-        let b = Lsn::parse("0/200").unwrap();
-        assert!(a < b);
-    }
-
-    #[test]
-    fn test_lsn_zero() {
-        assert_eq!(Lsn::ZERO.to_string(), "0/0");
-    }
-
-    #[test]
-    fn test_table_phase_roundtrip() {
-        for phase in [
-            TablePhase::Pending,
-            TablePhase::Backfilling,
-            TablePhase::Streaming,
-        ] {
-            assert_eq!(phase.as_str().parse::<TablePhase>().unwrap(), phase);
-        }
-    }
-
-    #[test]
-    fn test_ctid_partition_equality() {
-        let a = CtidPartition {
-            id: 0,
-            start_page: 0,
-            end_page: 100,
-        };
-        let b = CtidPartition {
-            id: 0,
-            start_page: 0,
-            end_page: 100,
-        };
-        assert_eq!(a, b);
-    }
-}
+#[path = "models_test.rs"]
+mod models_test;

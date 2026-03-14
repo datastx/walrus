@@ -2,7 +2,7 @@ mod backfill_processor;
 mod catalog;
 mod cdc_processor;
 mod compaction;
-pub mod ddl_handler;
+pub(crate) mod ddl_handler;
 mod duckdb_engine;
 mod processor;
 
@@ -49,7 +49,6 @@ async fn main() -> anyhow::Result<()> {
         "Starting Iceberg Writer service"
     );
 
-    // Graceful shutdown
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
@@ -57,7 +56,6 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    // Health server
     let health = HealthState::default();
     let health_clone = health.clone();
     let health_port = config.iceberg_writer.health_port;
@@ -67,19 +65,15 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Connect to metadata store
     let metadata = MetadataStore::connect(&config.source.connection_string()).await?;
 
-    // Recovery: reclaim stale processing files
     let reclaimed = metadata.reclaim_stale_processing().await?;
     if reclaimed > 0 {
         info!(reclaimed, "Reclaimed stale processing files");
     }
 
-    // Initialize Iceberg catalog
     let iceberg_catalog = Arc::new(catalog::init_catalog(&config.iceberg_writer).await?);
 
-    // Ensure Iceberg tables exist for all configured source tables
     for (schema, table) in config.source.table_list() {
         let pk = config.source.pk_for_table(&schema, &table);
         let pk_from_db = if pk.is_empty() {
@@ -113,7 +107,6 @@ async fn main() -> anyhow::Result<()> {
     health.set_ready(true);
     health.set_alive(true);
 
-    // Spawn compaction on a timer
     let compaction_interval = config.iceberg_writer.compaction_interval_hours;
     let compaction_threshold = config.iceberg_writer.compaction_delete_threshold;
     let compaction_catalog = Arc::clone(&iceberg_catalog);
@@ -143,7 +136,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Spawn periodic cleanup of completed staging files
     let cleanup_hours = config.staging.cleanup_after_hours;
     let cleanup_metadata = metadata.clone();
     let cleanup_staging_root = config.staging.root.clone();
@@ -175,7 +167,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Run main processing loop
     processor::run_processing_loop(
         &config.source,
         &config.iceberg_writer,
@@ -186,7 +177,6 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Cleanup old completed files before exit
     let cleaned = metadata
         .cleanup_completed(config.staging.cleanup_after_hours)
         .await?;

@@ -21,7 +21,7 @@ impl DuckDbEngine {
     pub fn load_staged_files(&self, file_paths: &[String]) -> anyhow::Result<()> {
         let file_list = file_paths
             .iter()
-            .map(|p| format!("'{}'", p))
+            .map(|p| format!("'{}'", p.replace('\'', "''")))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -55,14 +55,12 @@ impl DuckDbEngine {
     pub fn separate_operations(&self, pk_columns: &[String]) -> anyhow::Result<()> {
         let pk_csv = pk_columns.join(", ");
 
-        // Rows to upsert (inserts and updates — full new row, no metadata columns)
         self.conn.execute_batch(
             "CREATE OR REPLACE TABLE to_upsert AS \
              SELECT * EXCLUDE (_pgiceberg_op, _pgiceberg_ts) \
              FROM deduped WHERE _pgiceberg_op IN ('I', 'U')",
         )?;
 
-        // Delete keys (just PK columns for equality delete files)
         let sql = format!(
             "CREATE OR REPLACE TABLE delete_keys AS \
              SELECT {} FROM deduped WHERE _pgiceberg_op IN ('U', 'D')",
@@ -77,9 +75,10 @@ impl DuckDbEngine {
     pub fn export_upserts(&self, output_path: &Path) -> anyhow::Result<u64> {
         let count = self.table_count("to_upsert")?;
         if count > 0 {
+            let escaped = output_path.display().to_string().replace('\'', "''");
             let sql = format!(
                 "COPY to_upsert TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
-                output_path.display()
+                escaped
             );
             self.conn.execute_batch(&sql)?;
         }
@@ -90,9 +89,10 @@ impl DuckDbEngine {
     pub fn export_deletes(&self, output_path: &Path) -> anyhow::Result<u64> {
         let count = self.table_count("delete_keys")?;
         if count > 0 {
+            let escaped = output_path.display().to_string().replace('\'', "''");
             let sql = format!(
                 "COPY delete_keys TO '{}' (FORMAT PARQUET, COMPRESSION ZSTD)",
-                output_path.display()
+                escaped
             );
             self.conn.execute_batch(&sql)?;
         }
