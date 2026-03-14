@@ -40,7 +40,6 @@ impl TablePhase {
             TablePhase::Streaming => "streaming",
         }
     }
-
 }
 
 impl std::str::FromStr for TablePhase {
@@ -74,7 +73,6 @@ impl FileStatus {
             FileStatus::Failed => "failed",
         }
     }
-
 }
 
 impl std::str::FromStr for FileStatus {
