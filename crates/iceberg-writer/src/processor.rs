@@ -112,12 +112,18 @@ pub async fn run_processing_loop(
         match result {
             Ok(()) => {
                 metadata.mark_files_completed(&file_ids).await?;
+                metrics::counter!("walrus_writer_batches_completed_total", "table" => table_key.clone())
+                    .increment(1);
+                metrics::counter!("walrus_writer_files_processed_total", "table" => table_key.clone())
+                    .increment(file_ids.len() as u64);
                 info!(table = %table_key, files = file_ids.len(), "Batch completed");
             }
             Err(e) => {
                 let retry_exceeded = files
                     .iter()
                     .any(|f| f.retry_count >= writer_config.max_retries);
+                metrics::counter!("walrus_writer_batch_errors_total", "table" => table_key.clone())
+                    .increment(1);
                 if retry_exceeded {
                     warn!(
                         table = %table_key,

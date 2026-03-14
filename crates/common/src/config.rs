@@ -12,13 +12,50 @@ pub struct AppConfig {
     pub iceberg_writer: IcebergWriterConfig,
 }
 
+/// TLS mode for Postgres connections.
+///
+/// Maps to PostgreSQL's `sslmode` parameter:
+///   - `disable`: No TLS
+///   - `prefer`: Try TLS, fall back to plaintext
+///   - `require`: Require TLS, skip certificate verification
+///   - `verify-ca`: Require TLS + verify CA chain
+///   - `verify-full`: Require TLS + verify CA chain + hostname
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsMode {
+    #[default]
+    Disable,
+    Prefer,
+    Require,
+    VerifyCa,
+    VerifyFull,
+}
+
+impl std::str::FromStr for TlsMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "disable" | "disabled" | "none" => Ok(TlsMode::Disable),
+            "prefer" => Ok(TlsMode::Prefer),
+            "require" => Ok(TlsMode::Require),
+            "verify-ca" | "verify_ca" => Ok(TlsMode::VerifyCa),
+            "verify-full" | "verify_full" => Ok(TlsMode::VerifyFull),
+            _ => Err(anyhow::anyhow!("Invalid TLS mode: {}", s)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SourceConfig {
     pub host: String,
     pub port: u16,
     pub database: String,
     pub user: String,
-    /// Name of the env var that holds the password (not the password itself).
+    /// Direct password (set by env var processing or config file).
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Legacy: name of the env var that holds the password.
+    /// Kept for backward compatibility but prefer `password` or PG_PASSWORD env var.
     #[serde(default = "default_password_env")]
     pub password_env: String,
     /// Direct password override (set by env var processing, not config file).
@@ -30,6 +67,13 @@ pub struct SourceConfig {
     pub publication_name: String,
     #[serde(default)]
     pub tables: HashMap<String, TableConfig>,
+    /// TLS mode for Postgres connections.
+    #[serde(default)]
+    pub tls_mode: TlsMode,
+    /// Path to CA certificate PEM file for TLS verification.
+    /// If not set and tls_mode is verify-ca or verify-full, system/Mozilla roots are used.
+    #[serde(default)]
+    pub tls_ca_cert: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -93,7 +137,11 @@ pub struct IcebergWriterConfig {
 
 impl SourceConfig {
     pub fn password(&self) -> String {
+        // Priority: password_override (from PG_PASSWORD env) > password (from config) > password_env indirection
         if let Some(ref pw) = self.password_override {
+            return pw.clone();
+        }
+        if let Some(ref pw) = self.password {
             return pw.clone();
         }
         std::env::var(&self.password_env).unwrap_or_default()
@@ -142,6 +190,7 @@ impl AppConfig {
     }
 
     fn apply_env_overrides(config: &mut AppConfig) {
+        // ── Source connection ──
         if let Ok(v) = std::env::var("PG_HOST") {
             config.source.host = v;
         }
@@ -159,12 +208,89 @@ impl AppConfig {
         if let Ok(v) = std::env::var("PG_PASSWORD") {
             config.source.password_override = Some(v);
         }
+        if let Ok(v) = std::env::var("PG_SLOT_NAME") {
+            config.source.slot_name = v;
+        }
+        if let Ok(v) = std::env::var("PG_PUBLICATION_NAME") {
+            config.source.publication_name = v;
+        }
+
+        // ── TLS ──
+        if let Ok(v) = std::env::var("PG_TLS_MODE") {
+            if let Ok(mode) = v.parse() {
+                config.source.tls_mode = mode;
+            }
+        }
+        if let Ok(v) = std::env::var("PG_TLS_CA_CERT") {
+            config.source.tls_ca_cert = Some(PathBuf::from(v));
+        }
+
+        // ── Staging ──
         if let Ok(v) = std::env::var("STAGING_ROOT") {
             config.staging.root = PathBuf::from(v);
         }
+        if let Ok(v) = std::env::var("CLEANUP_AFTER_HOURS") {
+            if let Ok(h) = v.parse() {
+                config.staging.cleanup_after_hours = h;
+            }
+        }
+
+        // ── WAL Capture tuning ──
+        if let Ok(v) = std::env::var("MAX_BATCH_ROWS") {
+            if let Ok(n) = v.parse() {
+                config.wal_capture.max_batch_rows = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MAX_BATCH_BYTES") {
+            if let Ok(n) = v.parse() {
+                config.wal_capture.max_batch_bytes = n;
+            }
+        }
+        if let Ok(v) = std::env::var("FLUSH_INTERVAL_SECONDS") {
+            if let Ok(n) = v.parse() {
+                config.wal_capture.flush_interval_seconds = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MAX_PARALLEL_TABLES") {
+            if let Ok(n) = v.parse() {
+                config.wal_capture.max_parallel_tables = n;
+            }
+        }
+        if let Ok(v) = std::env::var("ROWS_PER_PARTITION") {
+            if let Ok(n) = v.parse() {
+                config.wal_capture.rows_per_partition = n;
+            }
+        }
+        if let Ok(v) = std::env::var("WAL_CAPTURE_HEALTH_PORT") {
+            if let Ok(n) = v.parse() {
+                config.wal_capture.health_port = n;
+            }
+        }
+
+        // ── Iceberg Writer tuning ──
         if let Ok(v) = std::env::var("WAREHOUSE_PATH") {
             config.iceberg_writer.warehouse_path = PathBuf::from(v.clone());
             config.iceberg_writer.catalog_db_path = PathBuf::from(format!("{}/catalog.db", v));
+        }
+        if let Ok(v) = std::env::var("POLL_INTERVAL_SECONDS") {
+            if let Ok(n) = v.parse() {
+                config.iceberg_writer.poll_interval_seconds = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MAX_FILES_PER_BATCH") {
+            if let Ok(n) = v.parse() {
+                config.iceberg_writer.max_files_per_batch = n;
+            }
+        }
+        if let Ok(v) = std::env::var("MAX_RETRIES") {
+            if let Ok(n) = v.parse() {
+                config.iceberg_writer.max_retries = n;
+            }
+        }
+        if let Ok(v) = std::env::var("ICEBERG_WRITER_HEALTH_PORT") {
+            if let Ok(n) = v.parse() {
+                config.iceberg_writer.health_port = n;
+            }
         }
     }
 }

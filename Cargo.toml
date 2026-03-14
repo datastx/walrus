@@ -53,10 +53,21 @@ async-trait = "0.1"
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 
-# HTTP (health checks)
+# HTTP (health checks + metrics)
 axum = "0.8"
 tokio-util = { version = "0.7", features = ["rt"] }
+
+# TLS
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-postgres-rustls = "0.13"
+webpki-roots = "1"
+rustls-pki-types = "1"
+
+# Retry / backoff
+backoff = { version = "0.4", features = ["tokio"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }

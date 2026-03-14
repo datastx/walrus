@@ -1,5 +1,5 @@
 use pgiceberg_common::config::{
-    AppConfig, IcebergWriterConfig, SourceConfig, StagingConfig, WalCaptureConfig,
+    AppConfig, IcebergWriterConfig, SourceConfig, StagingConfig, TlsMode, WalCaptureConfig,
 };
 use pgiceberg_common::metadata::MetadataStore;
 use std::path::PathBuf;
@@ -21,6 +21,7 @@ pub fn test_config() -> AppConfig {
             port,
             database,
             user,
+            password: None,
             password_override: Some(password),
             password_env: "PG_PASSWORD".to_string(),
             slot_name: format!(
@@ -32,6 +33,8 @@ pub fn test_config() -> AppConfig {
                 &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]
             ),
             tables: std::collections::HashMap::new(),
+            tls_mode: TlsMode::Disable,
+            tls_ca_cert: None,
         },
         staging: StagingConfig {
             root: PathBuf::from("/tmp/pgiceberg-test-staging"),

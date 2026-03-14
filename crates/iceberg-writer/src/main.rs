@@ -8,7 +8,7 @@ mod processor;
 
 use clap::Parser;
 use pgiceberg_common::config::AppConfig;
-use pgiceberg_common::health::{serve_health, HealthState};
+use pgiceberg_common::health::{install_metrics_recorder, serve_health, HealthState};
 use pgiceberg_common::metadata::MetadataStore;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -43,6 +43,8 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let config = AppConfig::load(&cli.config)?;
 
+    let metrics_handle = install_metrics_recorder();
+
     info!(
         warehouse = %config.iceberg_writer.warehouse_path.display(),
         tables = config.source.tables.len(),
@@ -56,7 +58,10 @@ async fn main() -> anyhow::Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    let health = HealthState::default();
+    let health = HealthState {
+        metrics_handle: Some(metrics_handle),
+        ..Default::default()
+    };
     let health_clone = health.clone();
     let health_port = config.iceberg_writer.health_port;
     tokio::spawn(async move {
@@ -65,7 +70,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let metadata = MetadataStore::connect(&config.source.connection_string()).await?;
+    let metadata = MetadataStore::connect_with_tls(
+        &config.source.connection_string(),
+        &config.source.tls_mode,
+        config.source.tls_ca_cert.as_deref(),
+    )
+    .await?;
 
     let reclaimed = metadata.reclaim_stale_processing().await?;
     if reclaimed > 0 {
