@@ -191,7 +191,7 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
     let exists: bool = client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
-             WHERE table_schema = 'public' AND table_name = 'awsdms_ddl_audit')",
+             WHERE table_schema = 'public' AND table_name = 'walrus_ddl_audit')",
             &[],
         )
         .await?
@@ -200,7 +200,7 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
     if !exists {
         client
             .batch_execute(
-                "CREATE TABLE public.awsdms_ddl_audit (
+                "CREATE TABLE public.walrus_ddl_audit (
                     c_key     bigserial    PRIMARY KEY,
                     c_time    timestamp,
                     c_user    varchar(64),
@@ -213,12 +213,12 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
                 )",
             )
             .await?;
-        info!("Created awsdms_ddl_audit table");
+        info!("Created walrus_ddl_audit table");
     }
 
     client
         .batch_execute(
-            "CREATE OR REPLACE FUNCTION public.awsdms_intercept_ddl()
+            "CREATE OR REPLACE FUNCTION public.walrus_intercept_ddl()
              RETURNS event_trigger LANGUAGE plpgsql SECURITY DEFINER AS $$
              DECLARE _qry text;
              DECLARE _tbl_name text;
@@ -238,11 +238,11 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
                              EXIT;
                          END LOOP;
                      END IF;
-                     INSERT INTO public.awsdms_ddl_audit
+                     INSERT INTO public.walrus_ddl_audit
                      VALUES (default, current_timestamp, current_user,
                              cast(TXID_CURRENT() AS varchar(16)),
                              tg_tag, 0, _tbl_name, _tbl_schema, _qry);
-                     DELETE FROM public.awsdms_ddl_audit;
+                     DELETE FROM public.walrus_ddl_audit;
                  END IF;
              END;
              $$",
@@ -251,7 +251,7 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
 
     let trigger_exists: bool = client
         .query_one(
-            "SELECT EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtname = 'awsdms_intercept_ddl')",
+            "SELECT EXISTS(SELECT 1 FROM pg_event_trigger WHERE evtname = 'walrus_intercept_ddl')",
             &[],
         )
         .await?
@@ -260,9 +260,9 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
     if !trigger_exists {
         client
             .batch_execute(
-                "CREATE EVENT TRIGGER awsdms_intercept_ddl \
+                "CREATE EVENT TRIGGER walrus_intercept_ddl \
                  ON ddl_command_end \
-                 EXECUTE PROCEDURE public.awsdms_intercept_ddl()",
+                 EXECUTE PROCEDURE public.walrus_intercept_ddl()",
             )
             .await?;
         info!("Created DDL audit event trigger");
@@ -272,7 +272,7 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
     let in_pub: bool = client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_publication_tables \
-             WHERE pubname = $1 AND schemaname = 'public' AND tablename = 'awsdms_ddl_audit')",
+             WHERE pubname = $1 AND schemaname = 'public' AND tablename = 'walrus_ddl_audit')",
             &[&config.publication_name],
         )
         .await?
@@ -280,7 +280,7 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
 
     if !in_pub {
         let sql = format!(
-            "ALTER PUBLICATION {} ADD TABLE public.awsdms_ddl_audit",
+            "ALTER PUBLICATION {} ADD TABLE public.walrus_ddl_audit",
             quote_ident(&config.publication_name)
         );
         client.batch_execute(&sql).await?;

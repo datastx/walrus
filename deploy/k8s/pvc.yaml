@@ -11,8 +11,8 @@ spec:
   accessModes:
     - ReadWriteMany
   # Set storageClassName to match your cluster's RWX-capable provisioner
-  # (e.g., efs-sc for AWS EFS, nfs-client for NFS, etc.)
-  # storageClassName: efs-sc
+  # (e.g., nfs-client for NFS, etc.)
+  # storageClassName: nfs-client
   resources:
     requests:
       storage: 50Gi
@@ -30,7 +30,7 @@ spec:
   accessModes:
     - ReadWriteMany
   # Set storageClassName to match your cluster's RWX-capable provisioner
-  # storageClassName: efs-sc
+  # storageClassName: nfs-client
   resources:
     requests:
       storage: 100Gi
