@@ -325,6 +325,7 @@ fn decode_origin(data: &[u8]) -> anyhow::Result<PgOutputMessage> {
 /// Manages OID → RelationInfo mapping.  Populated by Relation messages in the
 /// WAL stream.  Service 1 uses this to know which table a given Insert/Update/
 /// Delete belongs to.
+#[derive(Default)]
 pub struct RelationCache {
     pub relations: HashMap<u32, CachedRelation>,
 }
@@ -338,9 +339,7 @@ pub struct CachedRelation {
 
 impl RelationCache {
     pub fn new() -> Self {
-        Self {
-            relations: HashMap::new(),
-        }
+        Self::default()
     }
 
     pub fn update(&mut self, oid: u32, schema: String, name: String, columns: Vec<RelationColumn>) {

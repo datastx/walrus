@@ -26,11 +26,11 @@ pub fn test_config() -> AppConfig {
             password_env: "PG_PASSWORD".to_string(),
             slot_name: format!(
                 "test_slot_{}",
-                uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string()
+                &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]
             ),
             publication_name: format!(
                 "test_pub_{}",
-                uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string()
+                &uuid::Uuid::new_v4().to_string().replace('-', "")[..8]
             ),
             tables: std::collections::HashMap::new(),
         },

@@ -179,6 +179,7 @@ async fn backfill_single_table(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn backfill_partition(
     source_config: &SourceConfig,
     metadata: &MetadataStore,

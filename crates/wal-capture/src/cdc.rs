@@ -67,6 +67,7 @@ impl TableBuffer {
 /// Recovery: on restart, reads `last_flushed_lsn` from metadata and resumes
 /// from there.  Any duplicate WAL re-reads produce idempotent results because
 /// Service 2 deduplicates on PK.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_cdc_loop(
     source_host: &str,
     source_port: u16,

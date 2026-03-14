@@ -280,7 +280,7 @@ async fn compute_partitions(
         relpages as u64
     };
 
-    let total = ((relpages as u64).max(1) + pages_per_partition - 1) / pages_per_partition;
+    let total = (relpages as u64).max(1).div_ceil(pages_per_partition);
     Ok(total.max(1))
 }
 

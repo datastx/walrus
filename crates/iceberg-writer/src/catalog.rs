@@ -39,9 +39,12 @@ pub async fn ensure_iceberg_table(
 ) -> anyhow::Result<Table> {
     let namespace = NamespaceIdent::new(schema_name.to_string());
 
-    match catalog.create_namespace(&namespace, HashMap::new()).await {
-        Ok(_) => info!(namespace = schema_name, "Created Iceberg namespace"),
-        Err(_) => {}
+    if catalog
+        .create_namespace(&namespace, HashMap::new())
+        .await
+        .is_ok()
+    {
+        info!(namespace = schema_name, "Created Iceberg namespace");
     }
 
     let table_ident = TableIdent::new(namespace.clone(), table_name.to_string());
