@@ -3,7 +3,7 @@ name: walrus
 description: Postgres to Apache Iceberg CDC replication
 type: application
 version: 0.1.0
-appVersion: "latest"
+appVersion: "0.1.0"
 home: https://github.com/datastx/walrus
 sources:
   - https://github.com/datastx/walrus
