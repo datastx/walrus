@@ -1,6 +1,7 @@
 pub(crate) mod backfill;
 mod bootstrap;
 mod cdc;
+pub(crate) mod copy_export;
 pub(crate) mod decoder;
 mod heartbeat;
 pub(crate) mod parquet_writer;

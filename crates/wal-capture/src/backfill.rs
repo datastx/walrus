@@ -1,8 +1,8 @@
-use crate::parquet_writer::write_rows_to_parquet;
+use crate::copy_export;
 use pgiceberg_common::config::{SourceConfig, WalCaptureConfig};
 use pgiceberg_common::metadata::{EnqueueFileParams, MetadataStore};
 use pgiceberg_common::models::{CtidPartition, FileType, TablePhase, TableState};
-use pgiceberg_common::sql::{quote_ident, validate_snapshot_name};
+use pgiceberg_common::sql::validate_snapshot_name;
 use pgiceberg_common::tls;
 use std::path::Path;
 use tracing::info;
@@ -206,31 +206,29 @@ async fn backfill_partition(
         .batch_execute(&format!("SET TRANSACTION SNAPSHOT '{}'", snapshot_name))
         .await?;
 
-    let quoted_table = format!("{}.{}", quote_ident(schema), quote_ident(table));
-    let query = if partition.start_page == 0 && partition.end_page == 0 {
-        format!("SELECT * FROM {} WHERE false", quoted_table)
-    } else {
-        format!(
-            "SELECT * FROM {} WHERE ctid >= '({},0)'::tid AND ctid < '({},0)'::tid",
-            quoted_table, partition.start_page, partition.end_page
-        )
-    };
+    // Query column metadata for binary COPY parsing
+    let columns = copy_export::get_columns(&client, schema, table).await?;
 
-    let rows = client.query(&query, &[]).await?;
+    // Run COPY export within the snapshot transaction
+    let copy_data = copy_export::run_copy(
+        &client,
+        schema,
+        table,
+        &columns,
+        partition.start_page,
+        partition.end_page,
+    )
+    .await?;
 
     client.batch_execute("COMMIT").await?;
 
-    let row_count = rows.len() as i64;
-
-    let dir = staging_root
+    let file_path = staging_root
         .join("backfill")
-        .join(format!("{}.{}", schema, table));
-    let file_path = dir.join(format!("{}.parquet", partition.id));
+        .join(format!("{}.{}", schema, table))
+        .join(format!("{}.parquet", partition.id));
 
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        write_rows_to_parquet(&rows, &file_path)?;
-        Ok(())
+    let row_count = tokio::task::spawn_blocking(move || -> anyhow::Result<i64> {
+        copy_export::write_binary_to_parquet(&copy_data, &columns, &file_path)
     })
     .await??;
 
