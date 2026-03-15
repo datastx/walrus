@@ -1,0 +1,135 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "walrus.fullname" . }}-iceberg-writer
+  labels:
+    {{- include "walrus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: iceberg-writer
+spec:
+  replicas: {{ .Values.icebergWriter.replicaCount }}
+  strategy:
+    {{- toYaml .Values.icebergWriter.strategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "walrus.icebergWriter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "walrus.icebergWriter.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: iceberg-writer
+      annotations:
+        checksum/config: {{ include "walrus.tomlConfig" . | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8082"
+        prometheus.io/path: "/metrics"
+        {{- with .Values.icebergWriter.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccountName }}
+      terminationGracePeriodSeconds: {{ .Values.icebergWriter.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: iceberg-writer
+          image: "{{ .Values.icebergWriter.image.repository }}:{{ include "walrus.icebergWriter.imageTag" . }}"
+          imagePullPolicy: {{ .Values.icebergWriter.image.pullPolicy }}
+          ports:
+            - name: health
+              containerPort: 8082
+              protocol: TCP
+          env:
+            - name: PG_HOST
+              value: {{ .Values.config.source.host | quote }}
+            - name: PG_PORT
+              value: {{ .Values.config.source.port | quote }}
+            - name: PG_DATABASE
+              value: {{ .Values.config.source.database | quote }}
+            - name: PG_USER
+              value: {{ .Values.config.source.user | quote }}
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "walrus.secretName" . }}
+                  key: {{ .Values.secret.passwordKey }}
+            {{- if .Values.config.source.tlsMode }}
+            - name: PG_TLS_MODE
+              value: {{ .Values.config.source.tlsMode | quote }}
+            {{- end }}
+            - name: STAGING_ROOT
+              value: {{ .Values.config.staging.root | quote }}
+            - name: WAREHOUSE_PATH
+              value: {{ .Values.config.icebergWriter.warehousePath | quote }}
+            - name: PGICEBERG_CONFIG
+              value: "/etc/pgiceberg/pgiceberg.toml"
+            - name: RUST_LOG
+              value: {{ .Values.rustLog | quote }}
+            {{- with .Values.icebergWriter.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.icebergWriter.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: staging-data
+              mountPath: {{ .Values.config.staging.root }}
+              readOnly: true
+            - name: warehouse-data
+              mountPath: {{ .Values.config.icebergWriter.warehousePath }}
+            - name: config
+              mountPath: /etc/pgiceberg
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.icebergWriter.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: staging-data
+          persistentVolumeClaim:
+            claimName: {{ include "walrus.stagingClaimName" . }}
+        - name: warehouse-data
+          persistentVolumeClaim:
+            claimName: {{ include "walrus.warehouseClaimName" . }}
+        - name: config
+          configMap:
+            name: {{ include "walrus.fullname" . }}-config
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+        {{- with .Values.icebergWriter.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.icebergWriter.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.icebergWriter.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.icebergWriter.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

@@ -1,7 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: walrus
-  labels:
-    app.kubernetes.io/part-of: walrus
-    app.kubernetes.io/managed-by: kustomize

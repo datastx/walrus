@@ -1,0 +1,18 @@
+{{- if .Values.persistence.staging.create }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "walrus.stagingClaimName" . }}
+  labels:
+    {{- include "walrus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.staging.accessModes | nindent 4 }}
+  {{- if .Values.persistence.staging.storageClass }}
+  storageClassName: {{ .Values.persistence.staging.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.staging.size }}
+{{- end }}

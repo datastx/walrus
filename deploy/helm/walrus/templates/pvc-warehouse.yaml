@@ -1,0 +1,18 @@
+{{- if .Values.persistence.warehouse.create }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "walrus.warehouseClaimName" . }}
+  labels:
+    {{- include "walrus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: storage
+spec:
+  accessModes:
+    {{- toYaml .Values.persistence.warehouse.accessModes | nindent 4 }}
+  {{- if .Values.persistence.warehouse.storageClass }}
+  storageClassName: {{ .Values.persistence.warehouse.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.warehouse.size }}
+{{- end }}

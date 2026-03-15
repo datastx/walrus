@@ -1,0 +1,137 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "walrus.fullname" . }}-wal-capture
+  labels:
+    {{- include "walrus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: wal-capture
+spec:
+  # WAL Capture MUST run as exactly one replica.
+  # Multiple consumers on the same Postgres replication slot causes data corruption.
+  replicas: 1
+  serviceName: {{ include "walrus.fullname" . }}-wal-capture
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
+  selector:
+    matchLabels:
+      {{- include "walrus.walCapture.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "walrus.walCapture.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: wal-capture
+      annotations:
+        checksum/config: {{ include "walrus.tomlConfig" . | sha256sum }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+        {{- with .Values.walCapture.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccountName }}
+      terminationGracePeriodSeconds: {{ .Values.walCapture.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: wal-capture
+          image: "{{ .Values.walCapture.image.repository }}:{{ include "walrus.walCapture.imageTag" . }}"
+          imagePullPolicy: {{ .Values.walCapture.image.pullPolicy }}
+          ports:
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          env:
+            - name: PG_HOST
+              value: {{ .Values.config.source.host | quote }}
+            - name: PG_PORT
+              value: {{ .Values.config.source.port | quote }}
+            - name: PG_DATABASE
+              value: {{ .Values.config.source.database | quote }}
+            - name: PG_USER
+              value: {{ .Values.config.source.user | quote }}
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "walrus.secretName" . }}
+                  key: {{ .Values.secret.passwordKey }}
+            - name: PG_SLOT_NAME
+              value: {{ .Values.config.source.slotName | quote }}
+            - name: PG_PUBLICATION_NAME
+              value: {{ .Values.config.source.publicationName | quote }}
+            {{- if .Values.config.source.tlsMode }}
+            - name: PG_TLS_MODE
+              value: {{ .Values.config.source.tlsMode | quote }}
+            {{- end }}
+            - name: STAGING_ROOT
+              value: {{ .Values.config.staging.root | quote }}
+            - name: PGICEBERG_CONFIG
+              value: "/etc/pgiceberg/pgiceberg.toml"
+            - name: RUST_LOG
+              value: {{ .Values.rustLog | quote }}
+            {{- with .Values.walCapture.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.walCapture.resources | nindent 12 }}
+          securityContext:
+            {{- toYaml .Values.containerSecurityContext | nindent 12 }}
+          volumeMounts:
+            - name: staging-data
+              mountPath: {{ .Values.config.staging.root }}
+            - name: config
+              mountPath: /etc/pgiceberg
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.walCapture.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: staging-data
+          persistentVolumeClaim:
+            claimName: {{ include "walrus.stagingClaimName" . }}
+        - name: config
+          configMap:
+            name: {{ include "walrus.fullname" . }}-config
+        - name: tmp
+          emptyDir:
+            sizeLimit: 100Mi
+        {{- with .Values.walCapture.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.walCapture.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.walCapture.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.walCapture.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
