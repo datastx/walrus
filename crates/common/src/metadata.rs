@@ -337,6 +337,30 @@ impl MetadataStore {
         Ok(result > 0)
     }
 
+    /// Get all pending backfill file paths for a specific table.
+    ///
+    /// Returns `(file_id, file_path)` for every backfill file with status
+    /// 'pending' or 'processing' for this table, ordered by creation time.
+    /// Used during resync to collect the complete new snapshot for diffing.
+    pub async fn get_all_pending_backfill_paths(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> anyhow::Result<Vec<(uuid::Uuid, String)>> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT file_id, file_path FROM _pgiceberg.file_queue \
+                 WHERE table_schema = $1 AND table_name = $2 \
+                   AND file_type = 'backfill' \
+                   AND status IN ('pending', 'processing') \
+                 ORDER BY created_at",
+                &[&schema, &table],
+            )
+            .await?;
+        Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
+    }
+
     /// Clear the needs_resync flag after the Iceberg table has been dropped
     /// and recreated.  Subsequent backfill batches for this table should append
     /// normally rather than triggering another drop.
