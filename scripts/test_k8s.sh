@@ -12,7 +12,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Wait for a pod to be Ready, tolerating CrashLoopBackOff restarts.
+# Wait for a workload to have at least 1 ready replica, tolerating CrashLoopBackOff.
 # Usage: wait_for_ready <resource> <timeout_seconds>
 wait_for_ready() {
     local resource="$1"
@@ -47,36 +47,38 @@ echo "=== Loading images into kind ==="
 kind load docker-image walrus/wal-capture:test --name "$CLUSTER_NAME"
 kind load docker-image walrus/iceberg-writer:test --name "$CLUSTER_NAME"
 
-echo "=== Applying K8s manifests ==="
-# ServiceMonitor CRDs (Prometheus Operator) aren't installed in kind, so
-# kubectl apply will error on those resources. Tolerate that specific failure.
-APPLY_OUTPUT=$(kubectl apply -k "$REPO_ROOT/deploy/k8s-test/" 2>&1) || {
-    if echo "$APPLY_OUTPUT" | grep -q "ServiceMonitor" && \
-       ! echo "$APPLY_OUTPUT" | grep "^error:" | grep -vq "ServiceMonitor"; then
-        echo "  (Ignoring missing ServiceMonitor CRDs -- expected in test clusters)"
-    else
-        echo "$APPLY_OUTPUT"
-        exit 1
-    fi
-}
-echo "$APPLY_OUTPUT" | grep -v "^error:" || true
-
-echo "=== Waiting for Postgres to be ready ==="
+echo "=== Deploying test Postgres ==="
+kubectl create namespace "$NAMESPACE"
+kubectl apply -f "$REPO_ROOT/deploy/helm/test-postgres.yaml"
 kubectl -n "$NAMESPACE" rollout status statefulset/postgres --timeout=120s
-
-# Give Postgres time to finish init SQL before services connect
+# Give Postgres time to finish init SQL
 sleep 10
 
+echo "=== Installing Walrus via Helm ==="
+helm install walrus "$REPO_ROOT/deploy/helm/walrus/" \
+    --namespace "$NAMESPACE" \
+    --set config.source.host=postgres \
+    --set config.source.tlsMode=disable \
+    --set secret.pgPassword=testpass \
+    --set walCapture.image.repository=walrus/wal-capture \
+    --set walCapture.image.tag=test \
+    --set icebergWriter.image.repository=walrus/iceberg-writer \
+    --set icebergWriter.image.tag=test \
+    --set persistence.staging.accessModes[0]=ReadWriteOnce \
+    --set persistence.staging.size=1Gi \
+    --set persistence.warehouse.accessModes[0]=ReadWriteOnce \
+    --set persistence.warehouse.size=1Gi
+
 echo "=== Waiting for WAL Capture to be ready ==="
-wait_for_ready statefulset/wal-capture 300
+wait_for_ready statefulset/walrus-wal-capture 300
 
 echo "=== Waiting for Iceberg Writer to be ready ==="
-wait_for_ready deployment/iceberg-writer 300
+wait_for_ready deployment/walrus-iceberg-writer 300
 
 echo "=== Verifying health endpoints ==="
 
 # Port-forward WAL Capture health endpoint
-kubectl -n "$NAMESPACE" port-forward statefulset/wal-capture 18081:8081 &
+kubectl -n "$NAMESPACE" port-forward statefulset/walrus-wal-capture 18081:8081 &
 PF_WAL_PID=$!
 sleep 2
 
@@ -89,12 +91,12 @@ if [ "$WAL_HEALTH" = "200" ]; then
 else
     echo "  FAIL: WAL Capture /healthz returned $WAL_HEALTH"
     echo "--- WAL Capture logs ---"
-    kubectl -n "$NAMESPACE" logs statefulset/wal-capture --tail=50
+    kubectl -n "$NAMESPACE" logs statefulset/walrus-wal-capture --tail=50
     exit 1
 fi
 
 # Port-forward Iceberg Writer health endpoint
-kubectl -n "$NAMESPACE" port-forward deployment/iceberg-writer 18082:8082 &
+kubectl -n "$NAMESPACE" port-forward deployment/walrus-iceberg-writer 18082:8082 &
 PF_ICE_PID=$!
 sleep 2
 
@@ -107,13 +109,12 @@ if [ "$ICE_HEALTH" = "200" ]; then
 else
     echo "  FAIL: Iceberg Writer /healthz returned $ICE_HEALTH"
     echo "--- Iceberg Writer logs ---"
-    kubectl -n "$NAMESPACE" logs deployment/iceberg-writer --tail=50
+    kubectl -n "$NAMESPACE" logs deployment/walrus-iceberg-writer --tail=50
     exit 1
 fi
 
 echo "=== Smoke test: verify replication state ==="
 
-# Wait for replication state to appear (backfill start creates it)
 RETRIES=0
 MAX_RETRIES=30
 while [ $RETRIES -lt $MAX_RETRIES ]; do
@@ -133,7 +134,7 @@ done
 if [ $RETRIES -eq $MAX_RETRIES ]; then
     echo "  FAIL: Replication state not created after ${MAX_RETRIES} attempts"
     echo "--- WAL Capture logs ---"
-    kubectl -n "$NAMESPACE" logs statefulset/wal-capture --tail=100
+    kubectl -n "$NAMESPACE" logs statefulset/walrus-wal-capture --tail=100
     exit 1
 fi
 

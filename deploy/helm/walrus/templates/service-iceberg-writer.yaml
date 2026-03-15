@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "walrus.fullname" . }}-iceberg-writer
+  labels:
+    {{- include "walrus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: iceberg-writer
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "walrus.icebergWriter.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: health
+      port: 8082
+      targetPort: health
+      protocol: TCP

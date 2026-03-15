@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "walrus.fullname" . }}-wal-capture
+  labels:
+    {{- include "walrus.labels" . | nindent 4 }}
+    app.kubernetes.io/component: wal-capture
+spec:
+  clusterIP: None
+  selector:
+    {{- include "walrus.walCapture.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: health
+      port: 8081
+      targetPort: health
+      protocol: TCP

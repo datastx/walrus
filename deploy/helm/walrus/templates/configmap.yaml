@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "walrus.fullname" . }}-config
+  labels:
+    {{- include "walrus.labels" . | nindent 4 }}
+data:
+  pgiceberg.toml: |
+    {{- if .Values.config.rawToml }}
+{{ .Values.config.rawToml | indent 4 }}
+    {{- else }}
+{{ include "walrus.tomlConfig" . | indent 4 }}
+    {{- end }}

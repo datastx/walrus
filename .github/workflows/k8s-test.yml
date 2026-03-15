@@ -36,5 +36,8 @@ jobs:
           chmod +x ./kubectl
           sudo mv ./kubectl /usr/local/bin/kubectl
 
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
       - name: Run K8s integration test
         run: make test-k8s

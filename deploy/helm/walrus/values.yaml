@@ -1,0 +1,191 @@
+# -- Override the release name
+nameOverride: ""
+# -- Override the full name
+fullnameOverride: ""
+
+# -- Create a Namespace resource (usually not needed; use helm --create-namespace)
+createNamespace: false
+
+# -- Global image pull secrets
+imagePullSecrets: []
+
+# -- Service account name for both components
+serviceAccountName: default
+
+# ============================================================
+# WAL Capture (StatefulSet — always exactly 1 replica)
+# ============================================================
+walCapture:
+  image:
+    repository: ghcr.io/datastx/walrus/wal-capture
+    # -- Defaults to Chart.appVersion if empty
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  terminationGracePeriodSeconds: 60
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+
+# ============================================================
+# Iceberg Writer (Deployment)
+# ============================================================
+icebergWriter:
+  # -- Replica count (safe to scale; file queue claiming is atomic)
+  replicaCount: 1
+
+  image:
+    repository: ghcr.io/datastx/walrus/iceberg-writer
+    # -- Defaults to Chart.appVersion if empty
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+
+  podAnnotations: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  terminationGracePeriodSeconds: 60
+  extraEnv: []
+  extraVolumeMounts: []
+  extraVolumes: []
+
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+
+# ============================================================
+# Application Configuration (rendered into pgiceberg.toml)
+# ============================================================
+config:
+  source:
+    host: localhost
+    port: 5432
+    database: sourcedb
+    user: replicator
+    passwordEnv: PG_PASSWORD
+    slotName: pgiceberg_slot
+    publicationName: pgiceberg_pub
+    tlsMode: prefer
+    # tlsCaCert: /path/to/ca.pem
+    tables:
+      "public.users": {}
+      "public.orders": {}
+      "public.products":
+        pk:
+          - product_id
+
+  staging:
+    root: /data/staging
+    cleanupAfterHours: 24
+
+  walCapture:
+    maxParallelTables: 4
+    maxParallelWorkersPerTable: 2
+    rowsPerPartition: 500000
+    maxBatchRows: 50000
+    maxBatchBytes: 67108864
+    flushIntervalSeconds: 30
+    idleTimeoutSeconds: 60
+
+  icebergWriter:
+    warehousePath: /data/iceberg
+    catalogDbPath: /data/iceberg/catalog.db
+    pollIntervalSeconds: 5
+    maxFilesPerBatch: 100
+    compactionIntervalHours: 6
+    compactionDeleteThreshold: 50
+    maxRetries: 3
+
+  # -- Override with raw TOML string (bypasses structured rendering if set)
+  rawToml: ""
+
+# ============================================================
+# Secret
+# ============================================================
+secret:
+  # -- Create the Secret resource
+  create: true
+  # -- Name of an existing secret (used when create=false)
+  existingSecretName: ""
+  # -- Key within the secret containing the Postgres password
+  passwordKey: PG_PASSWORD
+  # -- Postgres password (only used when create=true; MUST be overridden)
+  pgPassword: CHANGEME
+
+# ============================================================
+# Persistence
+# ============================================================
+persistence:
+  staging:
+    # -- Create the PVC (set false to use existingClaim)
+    create: true
+    existingClaim: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteMany
+    size: 50Gi
+
+  warehouse:
+    create: true
+    existingClaim: ""
+    storageClass: ""
+    accessModes:
+      - ReadWriteMany
+    size: 100Gi
+
+# ============================================================
+# Metrics & Monitoring
+# ============================================================
+metrics:
+  serviceMonitor:
+    # -- Create ServiceMonitor resources (requires Prometheus Operator CRDs)
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    # -- Additional labels for ServiceMonitor resources
+    additionalLabels: {}
+
+# ============================================================
+# Pod Security Context (shared by both components)
+# ============================================================
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# ============================================================
+# Logging
+# ============================================================
+rustLog: info

@@ -1,0 +1,23 @@
+Walrus has been deployed!
+
+Check pod status:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/part-of=walrus
+
+WAL Capture health:
+  kubectl -n {{ .Release.Namespace }} port-forward statefulset/{{ include "walrus.fullname" . }}-wal-capture 8081:8081
+  curl http://localhost:8081/healthz
+
+Iceberg Writer health:
+  kubectl -n {{ .Release.Namespace }} port-forward deployment/{{ include "walrus.fullname" . }}-iceberg-writer 8082:8082
+  curl http://localhost:8082/healthz
+{{- if eq .Values.secret.pgPassword "CHANGEME" }}
+
+WARNING: You are using the default Postgres password.
+  Set a real password: --set secret.pgPassword=<your-password>
+  Or use an existing secret: --set secret.create=false --set secret.existingSecretName=<name>
+{{- end }}
+{{- if not .Values.metrics.serviceMonitor.enabled }}
+
+Prometheus ServiceMonitors are disabled. Enable with:
+  --set metrics.serviceMonitor.enabled=true
+{{- end }}
