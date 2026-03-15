@@ -5,7 +5,7 @@ use pgiceberg_common::models::TablePhase;
 use pgiceberg_common::sql::quote_ident;
 use pgiceberg_common::tls;
 use tokio_postgres::Client;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Slot creation result from `CREATE_REPLICATION_SLOT`.
 pub struct SlotInfo {
@@ -28,6 +28,18 @@ pub async fn bootstrap(
     metadata: &MetadataStore,
 ) -> anyhow::Result<Option<SlotInfo>> {
     metadata.bootstrap().await?;
+
+    // Always verify DDL audit infrastructure exists — it may have been dropped
+    // while the service was down.
+    {
+        let (client, _conn_handle) = tls::pg_connect(
+            &config.connection_string(),
+            &config.tls_mode,
+            config.tls_ca_cert.as_deref(),
+        )
+        .await?;
+        bootstrap_ddl_audit(&client, config).await?;
+    }
 
     let existing = metadata.get_replication_state(&config.slot_name).await?;
 
@@ -53,7 +65,6 @@ pub async fn bootstrap(
     drop_replication_slot_if_exists(&client, &config.slot_name).await?;
 
     let slot_info = create_replication_slot(&mut client, config).await?;
-    bootstrap_ddl_audit(&client, config).await?;
 
     metadata
         .insert_replication_state(
@@ -96,10 +107,7 @@ pub async fn drop_replication_slot(config: &SourceConfig) -> anyhow::Result<()> 
     drop_replication_slot_if_exists(&client, &config.slot_name).await
 }
 
-async fn drop_replication_slot_if_exists(
-    client: &Client,
-    slot_name: &str,
-) -> anyhow::Result<()> {
+async fn drop_replication_slot_if_exists(client: &Client, slot_name: &str) -> anyhow::Result<()> {
     let exists: bool = client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
@@ -352,21 +360,14 @@ async fn compute_partitions(
 
 /// Re-discover PKs from pg_index for all configured tables on startup.
 /// This makes the service stateless — it never depends on previously stored PK info
-/// except as a cache that we refresh.
+/// except as a cache that we refresh.  Uses `update_pk_columns` so the persisted
+/// lifecycle phase is never overwritten during recovery.
 async fn refresh_pk_columns(config: &SourceConfig, metadata: &MetadataStore) -> anyhow::Result<()> {
     for (schema, table) in config.table_list() {
         let pk_cols = discover_or_config_pk(config, metadata, &schema, &table).await?;
         if !pk_cols.is_empty() {
             metadata
-                .upsert_table_state(
-                    &schema,
-                    &table,
-                    // Don't change the phase — use whatever is persisted
-                    TablePhase::Pending, // upsert_table_state preserves existing phase on conflict
-                    None,
-                    None,
-                    &pk_cols,
-                )
+                .update_pk_columns(&schema, &table, &pk_cols)
                 .await?;
         }
     }
@@ -385,9 +386,14 @@ async fn discover_or_config_pk(
     }
     let from_pg = metadata.discover_primary_keys(schema, table).await?;
     if from_pg.is_empty() {
-        warn!(
+        anyhow::bail!(
+            "No primary key found for {}.{} — cannot replicate without a primary key. \
+             Either add a PK constraint or specify one in the config file under \
+             [source.tables.\"{}.{}\"] pk = [\"col\"]",
             schema,
-            table, "No primary key found — CDC merges will not work correctly"
+            table,
+            schema,
+            table,
         );
     }
     Ok(from_pg)

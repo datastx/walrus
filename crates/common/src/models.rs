@@ -36,6 +36,10 @@ impl std::fmt::Display for Lsn {
 pub enum TablePhase {
     Pending,
     Backfilling,
+    /// WAL Capture has finished exporting all partitions, but Iceberg Writer
+    /// has not yet processed all backfill files.  CDC files are staged but not
+    /// eligible for processing until the writer transitions to Streaming.
+    BackfillComplete,
     Streaming,
 }
 
@@ -44,6 +48,7 @@ impl TablePhase {
         match self {
             TablePhase::Pending => "pending",
             TablePhase::Backfilling => "backfilling",
+            TablePhase::BackfillComplete => "backfill_complete",
             TablePhase::Streaming => "streaming",
         }
     }
@@ -55,6 +60,7 @@ impl std::str::FromStr for TablePhase {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "backfilling" => TablePhase::Backfilling,
+            "backfill_complete" => TablePhase::BackfillComplete,
             "streaming" => TablePhase::Streaming,
             _ => TablePhase::Pending,
         })
@@ -108,15 +114,37 @@ pub struct ReplicationState {
 }
 
 /// Row from `_pgiceberg.table_state`
+///
+/// Columns are logically grouped by owner:
+///
+///   WAL Capture columns:
+///     backfill_total_partitions, backfill_done_partitions, backfill_snapshot_name
+///     — track the export of data from the source database to staging Parquet files.
+///
+///   Iceberg Writer columns:
+///     writer_backfill_files_done, writer_last_committed_lsn, streaming_since
+///     — track the commit of staged data into the Iceberg table.
+///
+///   Shared columns:
+///     phase, primary_key_columns, iceberg_schema_version
+///     — read by both services, written by whichever owns the transition.
 #[derive(Debug, Clone)]
 pub struct TableState {
     pub table_schema: String,
     pub table_name: String,
     pub phase: TablePhase,
+    // ── WAL Capture progress ──
     pub backfill_total_partitions: Option<i32>,
     pub backfill_done_partitions: i32,
     pub backfill_snapshot_name: Option<String>,
-    pub last_committed_lsn: Option<Lsn>,
+    // ── Iceberg Writer progress ──
+    /// Number of backfill files the writer has committed to Iceberg.
+    pub writer_backfill_files_done: i32,
+    /// Highest CDC LSN the writer has committed to Iceberg.
+    pub writer_last_committed_lsn: Option<Lsn>,
+    /// When the writer transitioned this table to streaming.
+    pub streaming_since: Option<DateTime<Utc>>,
+    // ── Shared ──
     pub iceberg_schema_version: i32,
     pub primary_key_columns: Vec<String>,
 }
