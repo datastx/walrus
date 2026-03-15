@@ -107,13 +107,81 @@ impl DuckDbEngine {
         Ok(count)
     }
 
+    // ── Resync operations ──────────────────────────────────────────
+
+    /// Load existing Iceberg data files and new backfill files into separate tables.
+    ///
+    /// Creates `old_data` (existing Iceberg rows) and `new_data` (fresh backfill rows).
+    pub fn load_resync_data(
+        &self,
+        old_files: &[String],
+        new_files: &[String],
+    ) -> anyhow::Result<()> {
+        let old_list = old_files
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let new_list = new_files
+            .iter()
+            .map(|p| format!("'{}'", p.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let sql = format!(
+            "CREATE OR REPLACE TABLE old_data AS SELECT * FROM read_parquet([{}])",
+            old_list
+        );
+        debug!(sql = %sql, "Loading existing Iceberg data into DuckDB");
+        self.conn.execute_batch(&sql)?;
+
+        let sql = format!(
+            "CREATE OR REPLACE TABLE new_data AS SELECT * FROM read_parquet([{}])",
+            new_list
+        );
+        debug!(sql = %sql, "Loading new backfill data into DuckDB");
+        self.conn.execute_batch(&sql)?;
+
+        Ok(())
+    }
+
+    /// Compute the diff between new_data and old_data using EXCEPT.
+    ///
+    /// Creates:
+    ///   - `to_upsert`: rows in new_data that are new or changed (full row EXCEPT)
+    ///   - `delete_keys`: PK values in old_data that no longer exist in new_data
+    pub fn compute_resync_diff(&self, pk_columns: &[String]) -> anyhow::Result<()> {
+        // Upserts: rows that are in the new snapshot but not (or changed) in the old
+        self.conn.execute_batch(
+            "CREATE OR REPLACE TABLE to_upsert AS \
+             SELECT * FROM new_data EXCEPT SELECT * FROM old_data",
+        )?;
+
+        // Deletes: PKs that exist in old data but not in new data
+        let pk_csv = pk_columns
+            .iter()
+            .map(|c| format!("\"{}\"", c))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "CREATE OR REPLACE TABLE delete_keys AS \
+             SELECT {pk} FROM old_data EXCEPT SELECT {pk} FROM new_data",
+            pk = pk_csv
+        );
+        self.conn.execute_batch(&sql)?;
+
+        Ok(())
+    }
+
     /// Clean up temp tables.
     pub fn cleanup(&self) -> anyhow::Result<()> {
         self.conn.execute_batch(
             "DROP TABLE IF EXISTS staged; \
              DROP TABLE IF EXISTS deduped; \
              DROP TABLE IF EXISTS to_upsert; \
-             DROP TABLE IF EXISTS delete_keys;",
+             DROP TABLE IF EXISTS delete_keys; \
+             DROP TABLE IF EXISTS old_data; \
+             DROP TABLE IF EXISTS new_data;",
         )?;
         Ok(())
     }

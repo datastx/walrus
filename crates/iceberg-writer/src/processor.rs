@@ -2,7 +2,7 @@ use crate::backfill_processor;
 use crate::catalog;
 use crate::cdc_processor;
 use crate::ddl_handler;
-use iceberg::Catalog;
+use crate::resync_processor;
 use iceberg_catalog_sql::SqlCatalog;
 use pgiceberg_common::config::{IcebergWriterConfig, SourceConfig};
 use pgiceberg_common::metadata::MetadataStore;
@@ -88,38 +88,22 @@ pub async fn run_processing_loop(
             pk
         };
 
-        // For resync tables (WAL continuity was broken), drop and recreate
-        // the Iceberg table before processing backfill data.  This ensures
-        // the table starts clean from the new snapshot rather than appending
-        // on top of stale data that may have gaps.
         let is_backfill = files
             .iter()
             .all(|f| f.file_type == pgiceberg_common::models::FileType::Backfill);
 
-        if is_backfill {
-            if let Some(state) = metadata
+        // For resync tables (WAL continuity was broken), diff-and-merge the
+        // new backfill snapshot against existing Iceberg data instead of
+        // dropping and recreating.  This preserves Iceberg snapshot history.
+        let needs_resync = if is_backfill {
+            metadata
                 .get_table_state(&files[0].table_schema, &files[0].table_name)
                 .await?
-            {
-                if state.needs_resync {
-                    let namespace = iceberg::NamespaceIdent::new(files[0].table_schema.clone());
-                    let table_ident =
-                        iceberg::TableIdent::new(namespace, files[0].table_name.clone());
-                    if catalog.table_exists(&table_ident).await? {
-                        catalog.drop_table(&table_ident).await?;
-                        info!(
-                            table = %table_key,
-                            "Dropped Iceberg table for resync — will recreate from new snapshot"
-                        );
-                    }
-                    // Clear the flag so we only drop once (subsequent backfill
-                    // batches for this table should append, not drop again).
-                    metadata
-                        .clear_resync_flag(&files[0].table_schema, &files[0].table_name)
-                        .await?;
-                }
-            }
-        }
+                .map(|s| s.needs_resync)
+                .unwrap_or(false)
+        } else {
+            false
+        };
 
         let mut table = catalog::ensure_iceberg_table(
             catalog,
@@ -132,7 +116,55 @@ pub async fn run_processing_loop(
 
         let file_ids: Vec<uuid::Uuid> = files.iter().map(|f| f.file_id).collect();
 
-        let result = if is_backfill {
+        let result = if needs_resync {
+            // Collect ALL pending backfill files for this table (not just the
+            // claimed batch) because the resync diff needs the complete new
+            // snapshot to compare against existing Iceberg data.
+            let all_pending = metadata
+                .get_all_pending_backfill_paths(&files[0].table_schema, &files[0].table_name)
+                .await?;
+
+            let all_file_ids: Vec<uuid::Uuid> = all_pending.iter().map(|(id, _)| *id).collect();
+            let all_file_paths: Vec<String> =
+                all_pending.iter().map(|(_, path)| path.clone()).collect();
+
+            info!(
+                table = %table_key,
+                total_backfill_files = all_file_paths.len(),
+                "Starting resync merge — diffing new backfill against existing Iceberg data"
+            );
+
+            let resync_result = resync_processor::process_resync(
+                &mut table,
+                &all_file_paths,
+                &pk_columns,
+                staging_root,
+                catalog,
+            )
+            .await;
+
+            match &resync_result {
+                Ok(r) => {
+                    info!(
+                        table = %table_key,
+                        upserts = r.upsert_count,
+                        deletes = r.delete_count,
+                        "Resync merge completed"
+                    );
+                    // Mark all pending backfill files as completed
+                    metadata.mark_files_completed(&all_file_ids).await?;
+                    // Clear the resync flag so subsequent batches process normally
+                    metadata
+                        .clear_resync_flag(&files[0].table_schema, &files[0].table_name)
+                        .await?;
+                }
+                Err(_) => {
+                    // On error, mark just the claimed batch as failed (normal retry path)
+                }
+            }
+
+            resync_result.map(|_| ())
+        } else if is_backfill {
             backfill_processor::process_backfill_batch(&mut table, &files, staging_root, catalog)
                 .await
         } else {
@@ -142,17 +174,29 @@ pub async fn run_processing_loop(
 
         match result {
             Ok(()) => {
-                metadata.mark_files_completed(&file_ids).await?;
+                // For resync, files are already marked completed above.
+                // For normal backfill/CDC, mark the claimed batch as completed.
+                if !needs_resync {
+                    metadata.mark_files_completed(&file_ids).await?;
+                }
+
                 metrics::counter!("walrus_writer_batches_completed_total", "table" => table_key.clone())
                     .increment(1);
                 metrics::counter!("walrus_writer_files_processed_total", "table" => table_key.clone())
                     .increment(file_ids.len() as u64);
 
-                let is_backfill = files
-                    .iter()
-                    .all(|f| f.file_type == pgiceberg_common::models::FileType::Backfill);
-
-                if is_backfill {
+                if needs_resync {
+                    // Resync already logged completion; check streaming transition
+                    if metadata
+                        .try_transition_to_streaming(&files[0].table_schema, &files[0].table_name)
+                        .await?
+                    {
+                        info!(
+                            table = %table_key,
+                            "All backfill files processed — table is now streaming"
+                        );
+                    }
+                } else if is_backfill {
                     // Track writer-side backfill progress in table_state so
                     // the distinction between "exported to staging" and
                     // "committed to Iceberg" is visible from a single query.

@@ -5,6 +5,7 @@ mod compaction;
 pub(crate) mod ddl_handler;
 mod duckdb_engine;
 mod processor;
+mod resync_processor;
 
 use clap::Parser;
 use pgiceberg_common::config::AppConfig;
