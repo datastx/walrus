@@ -19,7 +19,7 @@ This means there is no Temporal, no Airflow, no message broker. Each service is 
 A dedicated schema in the source Postgres database holds four tables:
 
 - **Replication state** -- tracks the logical replication slot, the LSN (log sequence number) that has been safely staged, and the snapshot used during initial export.
-- **Table state** -- tracks each table's lifecycle phase (pending, backfilling, backfill complete, or streaming), how far along backfill has progressed, and the primary key columns. Importantly, the two services own different phase transitions: WAL Capture moves a table from pending through backfilling to backfill complete, and the Iceberg Writer is the authority that promotes a table to streaming once it has confirmed all backfill data is written to Iceberg.
+- **Table state** -- tracks each table's lifecycle phase (pending, backfilling, backfill complete, or streaming), how far along backfill has progressed, and the primary key columns. Importantly, the two services own different phase transitions: WAL Capture moves a table from pending through backfilling to backfill complete, and the Iceberg Writer is the authority that promotes a table to streaming once it has confirmed all backfill data is written to Iceberg. The table state also tracks the writer's own progress separately from WAL Capture's export progress, so you can always see both how much data has been exported to staging files and how much of that data has actually been committed to Iceberg. If the replication slot was ever invalidated and the table had to be re-exported, a resync flag records that fact so the writer knows to replace the existing Iceberg data rather than appending to it.
 - **File queue** -- a work queue of staged Parquet files. WAL Capture inserts entries, Iceberg Writer claims and processes them.
 - **DDL events** -- captures schema changes (add column, drop column, etc.) so they can be propagated to the Iceberg table.
 
@@ -36,6 +36,8 @@ First, the service ensures the metadata schema and its four tables exist in the 
 Second, it verifies that the DDL audit infrastructure is installed on the source database. This includes the audit table, the event trigger function, and the event trigger itself. These objects could have been dropped by a DBA or lost during a database restore, so Walrus checks and recreates them on every startup rather than assuming they survived from the original bootstrap.
 
 Third, it checks whether a replication slot and its associated state already exist. If they do, this is a recovery scenario and the service picks up where it left off. If they do not, this is a fresh start and the service creates a new logical replication slot, captures a snapshot identifier for the initial export, and persists both the slot position and the snapshot name to the replication state table. Persisting the snapshot name is essential for crash recovery: if the service goes down mid-backfill and comes back up, it needs the original snapshot to resume the export from the exact point-in-time it started with.
+
+On recovery, the service also verifies that the replication slot actually still exists in the source database. The metadata might say a slot exists, but Postgres could have invalidated it while the service was down — for example, if WAL retention limits were exceeded and the database decided to discard the slot rather than let disk fill up. If the slot is gone, the service cannot simply resume from where it left off because there is a gap in the change history. Any changes that happened between the last confirmed position and now are lost from the slot's perspective. Walrus detects this condition and triggers a full re-bootstrap, which is described in detail in the Crash Recovery section below.
 
 Fourth, it gathers metadata about every table it has been configured to replicate. The most important piece of metadata is the primary key. Walrus discovers primary keys from the source database catalog on every startup so it never relies on stale cached information. If a table has no primary key constraint and none is specified in the configuration file, the service refuses to start. A primary key is non-negotiable because the entire CDC merge pipeline depends on it for deduplication, upsert resolution, and delete propagation. Without one, data in the Iceberg table would silently diverge from the source.
 
@@ -176,6 +178,20 @@ Every step is designed to be safe across restarts. On startup, WAL Capture alway
 - **Source Postgres restarts** -- the replication slot persists. WAL Capture reconnects and resumes from where it left off.
 
 The replication slot is never advanced past what has been safely written to disk and enqueued. This means Postgres retains WAL from the last checkpoint while the service is down, trading source disk usage for zero data loss.
+
+### Slot Invalidation and Resync
+
+The most serious recovery scenario is when the replication slot itself is gone. This happens when the service is down long enough that Postgres decides to discard the slot — typically because WAL retention limits were exceeded. When this happens, there is a gap in the change history: any inserts, updates, or deletes that occurred between the last confirmed position and the moment the new slot is created are not captured by either the old slot or the new one.
+
+This is not just a problem for tables that were mid-backfill. Tables that were already fully streaming are also affected. If a table was happily receiving live changes before the outage, and changes continued to happen during the outage, those changes are lost when the slot is recreated. Simply continuing to stream from the new slot would leave a hole in the data — the Iceberg table would be missing every change that happened in that window, with no indication that anything was wrong.
+
+Walrus handles this by treating slot invalidation as a full reset. When it detects the slot is gone on startup, it resets every table back to the beginning of the lifecycle and re-exports them from scratch using the new snapshot. Tables that were mid-backfill are straightforward — they had incomplete data and just start over. Tables that were already streaming require more care, because they already have data in Iceberg that may now be out of date.
+
+For those previously-streaming tables, Walrus marks them with a resync flag. This flag tells the Iceberg Writer that the table's existing data cannot be trusted. When the writer encounters backfill files for a table flagged for resync, it drops the existing Iceberg table and recreates it from the new snapshot data. This means the table is rebuilt from the ground up — every row comes from the fresh export, and there is no possibility of stale or missing data surviving from before the outage.
+
+The tradeoff is that dropping the Iceberg table discards its snapshot history. Any previous versions of the data are gone. But the alternative — silently continuing with a gap in the change history — is worse, because it produces an Iceberg table that looks correct but is quietly missing data. A clean rebuild is always preferable to silent data loss.
+
+After the resync backfill completes and the writer finishes processing all the new files, the table transitions back to streaming and the resync flag is cleared. From that point forward, the table behaves exactly as it would after a normal first-time backfill. Any stale CDC files from before the re-bootstrap are discarded during the reset, since their positions refer to the old slot and have no meaning in the context of the new one.
 
 ---
 

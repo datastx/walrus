@@ -166,7 +166,8 @@ impl MetadataStore {
                  backfill_snapshot_name, \
                  writer_backfill_files_done, writer_last_committed_lsn::text, \
                  streaming_since, \
-                 iceberg_schema_version, primary_key_columns \
+                 iceberg_schema_version, primary_key_columns, \
+                 needs_resync \
                  FROM _pgiceberg.table_state \
                  WHERE table_schema = $1 AND table_name = $2",
                 &[&schema, &table],
@@ -184,7 +185,8 @@ impl MetadataStore {
                  backfill_snapshot_name, \
                  writer_backfill_files_done, writer_last_committed_lsn::text, \
                  streaming_since, \
-                 iceberg_schema_version, primary_key_columns \
+                 iceberg_schema_version, primary_key_columns, \
+                 needs_resync \
                  FROM _pgiceberg.table_state",
                 &[],
             )
@@ -207,6 +209,7 @@ impl MetadataStore {
             streaming_since: r.get(8),
             iceberg_schema_version: r.get(9),
             primary_key_columns: r.get::<_, Vec<String>>(10),
+            needs_resync: r.get(11),
         }
     }
 
@@ -318,7 +321,8 @@ impl MetadataStore {
         let result = client
             .execute(
                 "UPDATE _pgiceberg.table_state \
-                 SET phase = 'streaming', streaming_since = now(), updated_at = now() \
+                 SET phase = 'streaming', streaming_since = now(), \
+                     needs_resync = FALSE, updated_at = now() \
                  WHERE table_schema = $1 AND table_name = $2 \
                    AND phase = 'backfill_complete' \
                    AND NOT EXISTS ( \
@@ -331,6 +335,22 @@ impl MetadataStore {
             )
             .await?;
         Ok(result > 0)
+    }
+
+    /// Clear the needs_resync flag after the Iceberg table has been dropped
+    /// and recreated.  Subsequent backfill batches for this table should append
+    /// normally rather than triggering another drop.
+    pub async fn clear_resync_flag(&self, schema: &str, table: &str) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE _pgiceberg.table_state \
+                 SET needs_resync = FALSE, updated_at = now() \
+                 WHERE table_schema = $1 AND table_name = $2",
+                &[&schema, &table],
+            )
+            .await?;
+        Ok(())
     }
 
     // ── writer progress ────────────────────────────────────────────
@@ -591,13 +611,18 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Reset tables for re-bootstrap: set backfilling tables back to pending,
-    /// clear their progress, and delete stale backfill file_queue entries.
+    /// Reset tables for re-bootstrap after a slot invalidation.
+    ///
+    /// Tables mid-backfill are reset to pending (no Iceberg data to worry about).
+    /// Tables that were streaming are also reset to pending but flagged with
+    /// `needs_resync = true` — the Iceberg Writer will drop and recreate the
+    /// Iceberg table before processing backfill files, ensuring no silent data
+    /// loss from the gap in WAL continuity.
     pub async fn reset_tables_for_rebootstrap(&self) -> anyhow::Result<()> {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
 
-        // Reset backfilling and backfill_complete tables to pending
+        // Reset backfilling and backfill_complete tables to pending (clean slate)
         txn.execute(
             "UPDATE _pgiceberg.table_state \
              SET phase = 'pending', \
@@ -610,10 +635,37 @@ impl MetadataStore {
         )
         .await?;
 
+        // Reset streaming tables to pending AND flag for resync.
+        // These tables have data in Iceberg but the WAL gap means changes
+        // were lost.  The writer must drop + recreate the Iceberg table.
+        txn.execute(
+            "UPDATE _pgiceberg.table_state \
+             SET phase = 'pending', \
+                 backfill_done_partitions = 0, \
+                 backfill_snapshot_name = NULL, \
+                 writer_backfill_files_done = 0, \
+                 writer_last_committed_lsn = NULL, \
+                 streaming_since = NULL, \
+                 needs_resync = TRUE, \
+                 updated_at = now() \
+             WHERE phase = 'streaming'",
+            &[],
+        )
+        .await?;
+
         // Delete pending/processing backfill file queue entries (stale)
         txn.execute(
             "DELETE FROM _pgiceberg.file_queue \
              WHERE file_type = 'backfill' AND status IN ('pending', 'processing')",
+            &[],
+        )
+        .await?;
+
+        // Delete pending/processing CDC file queue entries — the LSN range
+        // is discontinuous after slot recreation so these are meaningless.
+        txn.execute(
+            "DELETE FROM _pgiceberg.file_queue \
+             WHERE file_type = 'cdc_mixed' AND status IN ('pending', 'processing')",
             &[],
         )
         .await?;
@@ -819,6 +871,7 @@ CREATE TABLE IF NOT EXISTS _pgiceberg.table_state (
     -- Shared
     iceberg_schema_version      INT DEFAULT 0,
     primary_key_columns         TEXT[] DEFAULT '{}',
+    needs_resync                BOOLEAN DEFAULT FALSE,
     updated_at                  TIMESTAMPTZ DEFAULT now(),
     PRIMARY KEY (table_schema, table_name)
 );
@@ -863,4 +916,5 @@ ALTER TABLE _pgiceberg.ddl_events ADD COLUMN IF NOT EXISTS target_table TEXT NOT
 ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS writer_backfill_files_done INT DEFAULT 0;
 ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS writer_last_committed_lsn PG_LSN;
 ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS streaming_since TIMESTAMPTZ;
+ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS needs_resync BOOLEAN DEFAULT FALSE;
 "#;
