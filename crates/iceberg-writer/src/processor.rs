@@ -116,7 +116,61 @@ pub async fn run_processing_loop(
                     .increment(1);
                 metrics::counter!("walrus_writer_files_processed_total", "table" => table_key.clone())
                     .increment(file_ids.len() as u64);
-                info!(table = %table_key, files = file_ids.len(), "Batch completed");
+
+                let is_backfill = files
+                    .iter()
+                    .all(|f| f.file_type == pgiceberg_common::models::FileType::Backfill);
+
+                if is_backfill {
+                    // Track writer-side backfill progress in table_state so
+                    // the distinction between "exported to staging" and
+                    // "committed to Iceberg" is visible from a single query.
+                    metadata
+                        .advance_writer_backfill_progress(
+                            &files[0].table_schema,
+                            &files[0].table_name,
+                            file_ids.len() as i32,
+                        )
+                        .await?;
+                    info!(
+                        table = %table_key,
+                        files = file_ids.len(),
+                        "Backfill batch committed to Iceberg"
+                    );
+
+                    // Check if the table can transition to streaming.  This
+                    // only fires when the table phase is backfill_complete AND
+                    // no pending/processing backfill files remain — i.e. the
+                    // Iceberg Writer has fully absorbed the initial export.
+                    if metadata
+                        .try_transition_to_streaming(&files[0].table_schema, &files[0].table_name)
+                        .await?
+                    {
+                        info!(
+                            table = %table_key,
+                            "All backfill files processed — table is now streaming"
+                        );
+                    }
+                } else {
+                    // Track the highest CDC LSN committed to Iceberg so
+                    // operators can see how far behind the writer is relative
+                    // to the WAL consumer's flushed LSN.
+                    let max_lsn = files.iter().filter_map(|f| f.lsn_high).max();
+                    if let Some(lsn) = max_lsn {
+                        metadata
+                            .update_writer_committed_lsn(
+                                &files[0].table_schema,
+                                &files[0].table_name,
+                                &lsn,
+                            )
+                            .await?;
+                    }
+                    info!(
+                        table = %table_key,
+                        files = file_ids.len(),
+                        "CDC batch committed to Iceberg"
+                    );
+                }
             }
             Err(e) => {
                 let retry_exceeded = files

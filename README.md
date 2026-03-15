@@ -19,7 +19,7 @@ This means there is no Temporal, no Airflow, no message broker. Each service is 
 A dedicated schema in the source Postgres database holds four tables:
 
 - **Replication state** -- tracks the logical replication slot, the LSN (log sequence number) that has been safely staged, and the snapshot used during initial export.
-- **Table state** -- tracks each table's lifecycle phase (pending, backfilling, or streaming), how far along backfill has progressed, and the primary key columns.
+- **Table state** -- tracks each table's lifecycle phase (pending, backfilling, backfill complete, or streaming), how far along backfill has progressed, and the primary key columns. Importantly, the two services own different phase transitions: WAL Capture moves a table from pending through backfilling to backfill complete, and the Iceberg Writer is the authority that promotes a table to streaming once it has confirmed all backfill data is written to Iceberg.
 - **File queue** -- a work queue of staged Parquet files. WAL Capture inserts entries, Iceberg Writer claims and processes them.
 - **DDL events** -- captures schema changes (add column, drop column, etc.) so they can be propagated to the Iceberg table.
 
@@ -27,19 +27,57 @@ Using the source database for metadata avoids introducing another stateful depen
 
 ---
 
+## Startup and Preflight
+
+Every time WAL Capture starts, it runs a series of preflight checks before doing any real work. The goal is to verify that all the infrastructure Walrus depends on is in place, and to fail fast with a clear error if something is missing.
+
+First, the service ensures the metadata schema and its four tables exist in the source database. This check is idempotent so it is safe to run on every startup, whether this is a fresh deployment or a restart after a crash.
+
+Second, it verifies that the DDL audit infrastructure is installed on the source database. This includes the audit table, the event trigger function, and the event trigger itself. These objects could have been dropped by a DBA or lost during a database restore, so Walrus checks and recreates them on every startup rather than assuming they survived from the original bootstrap.
+
+Third, it checks whether a replication slot and its associated state already exist. If they do, this is a recovery scenario and the service picks up where it left off. If they do not, this is a fresh start and the service creates a new logical replication slot, captures a snapshot identifier for the initial export, and persists both the slot position and the snapshot name to the replication state table. Persisting the snapshot name is essential for crash recovery: if the service goes down mid-backfill and comes back up, it needs the original snapshot to resume the export from the exact point-in-time it started with.
+
+Fourth, it gathers metadata about every table it has been configured to replicate. The most important piece of metadata is the primary key. Walrus discovers primary keys from the source database catalog on every startup so it never relies on stale cached information. If a table has no primary key constraint and none is specified in the configuration file, the service refuses to start. A primary key is non-negotiable because the entire CDC merge pipeline depends on it for deduplication, upsert resolution, and delete propagation. Without one, data in the Iceberg table would silently diverge from the source.
+
+Finally, it checks the table state metadata to understand where each table is in its lifecycle. A table might be pending its first export, actively backfilling, finished exporting but waiting for the Iceberg Writer to absorb the data, or fully streaming. This determines which of the concurrent tasks need to run.
+
+---
+
 ## Lifecycle of a Table
 
-### Phase 1: Initial Export (Backfill)
+Each table moves through four phases. The two services share ownership of these transitions, and the phase a table is in determines what kind of work each service will do for it.
 
-When Walrus first starts, it creates a logical replication slot in Postgres. This slot pins a consistent point in the write-ahead log -- everything committed before that point is the "snapshot," and everything after is the ongoing change stream.
+### Pending
 
-For each configured table, Walrus reads the full contents at that snapshot point using range scans on Postgres's internal row addresses (CTID ranges). Each range is written as a Parquet file and enqueued in the file queue. Progress is checkpointed per-range, so if the service crashes mid-export, it resumes from the last completed range rather than starting over.
+A table starts in the pending phase when it is first registered. No data has been read from it yet. On the next startup where backfill work is needed, WAL Capture will pick it up.
 
-Multiple tables are exported in parallel with configurable concurrency.
+### Backfilling
 
-### Phase 2: Change Data Capture (CDC)
+WAL Capture moves a table from pending to backfilling when it begins reading the table's contents at the snapshot point. It scans the table using range queries on Postgres's internal row addresses (CTID ranges), writing each range as a Parquet file and enqueuing it in the file queue. Progress is checkpointed per-range, so if the service crashes mid-export, it resumes from the last completed range rather than starting over. Multiple tables are exported in parallel with configurable concurrency.
 
-The WAL consumer starts reading the change stream immediately -- it does not wait for backfill to finish. This is the key concurrency design: small tables finish their export quickly and start receiving live changes right away, while large tables continue exporting in the background without blocking anything.
+While this is happening, the WAL consumer is already running on a separate path, pulling changes off the replication slot for all tables including the ones still being backfilled. This is a critical design decision: the WAL stream must always be consumed so the replication slot does not hold back WAL on the source database. The backfill and the streaming operate independently, and neither waits for the other.
+
+The CDC files that accumulate for a table during backfill are staged to disk just like any other CDC data, but the Iceberg Writer knows not to process them yet. They sit in the file queue until the table is ready.
+
+### Backfill Complete
+
+When WAL Capture finishes exporting all partitions for a table, it moves the table to backfill complete. This signals that the export side of the work is done, but the Iceberg Writer has not yet confirmed that it has processed all of those backfill files and written them into the Iceberg table.
+
+This distinction matters because the Iceberg Writer is the authority on whether the initial data is safely in Iceberg. WAL Capture knows it finished producing the files, but only the writer knows whether it has consumed them all and committed them. Until that happens, the table stays in this intermediate phase.
+
+### Streaming
+
+The Iceberg Writer transitions a table from backfill complete to streaming after it has successfully processed every backfill file for that table. At that point, the writer begins processing the CDC files that have been accumulating in the queue. From here on, the table receives live changes with no further handoff between the services.
+
+This phase ownership model means the phase column in the metadata always reflects ground truth. A table marked as streaming genuinely has all of its initial data in Iceberg and is ready for live change processing. There is no window where the phase says streaming but backfill files are still in flight.
+
+### Why the WAL Consumer Never Waits
+
+The WAL consumer runs from the moment the service starts and never pauses, regardless of how many tables are still backfilling. This is intentional. The replication slot is the single point of WAL retention on the source database. If the consumer stops reading, Postgres holds onto WAL segments, and disk usage grows. By always consuming the stream, Walrus keeps the slot moving forward and avoids putting pressure on the source.
+
+The consequence is that CDC data arrives for tables that are not yet ready to process it. That is fine. The data is staged as Parquet files in the file queue, and the Iceberg Writer simply skips those tables until they reach the streaming phase. The ordering guarantee is enforced at the writer, not the consumer.
+
+### Change Data Capture Details
 
 Changes from the WAL stream (inserts, updates, deletes) are buffered in memory per-table and flushed to Parquet files on disk when any of three configurable thresholds is reached:
 
@@ -80,11 +118,11 @@ Walrus uses two complementary mechanisms:
 - [`logical_decoding_work_mem`](https://www.postgresql.org/docs/current/runtime-config-resource.html#GUC-LOGICAL-DECODING-WORK-MEM) controls when the server spills to disk (default 64 MB). Raising this reduces disk I/O but increases memory usage.
 - Monitoring `pg_stat_replication.write_lag` and `pg_replication_slots.wal_status` provides early warning of replication lag and WAL accumulation.
 
-### Phase 3: Iceberg Merge
+### Iceberg Merge
 
 The Iceberg Writer polls the file queue for pending work. For each batch of files:
 
-1. **Backfill files** are simple appends -- the data is written directly into the Iceberg table as new data files.
+1. **Backfill files** are simple appends -- the data is written directly into the Iceberg table as new data files. After each batch of backfill files is processed, the writer checks whether that table has any remaining backfill files in the queue. If the table's phase is backfill complete and no backfill files remain, the writer transitions the table to streaming. This is the moment the initial export is truly done from end to end.
 
 2. **CDC files** go through a merge pipeline:
    - The staged Parquet files are loaded and deduplicated by primary key, keeping only the latest operation for each key.
@@ -93,7 +131,7 @@ The Iceberg Writer polls the file queue for pending work. For each batch of file
    - Deletes produce Iceberg equality delete files containing just the primary key values of removed rows.
    - Both are committed atomically in a single Iceberg snapshot.
 
-The Iceberg Writer only processes CDC files for a table after that table's backfill is complete, ensuring correct ordering.
+The Iceberg Writer will only process CDC files for a table once that table has reached the streaming phase. This is the primary ordering guarantee: the writer is the authority that decides when a table is ready for live changes, and it only makes that decision after it has confirmed all backfill data is safely in Iceberg.
 
 ---
 
@@ -121,19 +159,19 @@ The single WAL stream is the fundamental constraint: Postgres delivers changes f
 - The **Backfill Manager** runs CTID-range scans against the snapshot, writing Parquet files for each range. Multiple tables are processed concurrently.
 - The **WAL Consumer** reads the change stream from the replication slot starting immediately. It stages changes for all tables, including those still being exported.
 
-The Iceberg Writer then enforces per-table ordering: it will not process CDC files for a table until all backfill files for that table are done. This means a small table that finishes its export in seconds starts receiving live changes almost immediately, while a billion-row table can take hours to export without blocking any other table.
+The Iceberg Writer enforces per-table ordering through the phase model. It processes backfill files as they arrive, and once all backfill files for a table are absorbed, it transitions that table to streaming and begins processing its CDC files. A small table that finishes its export in seconds reaches streaming almost immediately, while a billion-row table can take hours to export without blocking any other table. The WAL consumer never stops reading during any of this -- it stages CDC data for every table regardless of phase, and the writer decides when each table is ready to consume it.
 
 ---
 
 ## Crash Recovery
 
-Every step is designed to be safe across restarts:
+Every step is designed to be safe across restarts. On startup, WAL Capture always re-verifies the DDL audit infrastructure (the event trigger, the audit table, and its publication membership) regardless of whether this is a fresh start or recovery. It also re-discovers primary keys from the source catalog without overwriting any persisted lifecycle phase, so a table that was in the middle of backfilling or waiting for the writer to finish stays in exactly the phase it was in before the crash.
 
-- **WAL Capture crashes during export** -- the metadata store records which ranges are done. On restart, the service resumes from the next incomplete range. If the snapshot has expired (the service was down too long), the slot is recreated and export starts over.
+- **WAL Capture crashes during export** -- the metadata store records which ranges are done. On restart, the service resumes from the next incomplete range. If the snapshot has expired (the service was down too long), the slot is recreated, any tables that were mid-backfill or waiting for the writer are reset to pending, and the export starts over.
 
 - **WAL Capture crashes during CDC** -- in-memory buffers are lost. On restart, the WAL is re-read from the last checkpointed LSN. Any Parquet files that were written but not enqueued are orphaned and cleaned up later.
 
-- **Iceberg Writer crashes during processing** -- files stuck in "processing" for more than ten minutes are automatically reclaimed on the next startup. If an Iceberg commit completed before the crash, re-processing the same files produces duplicate data files and equality deletes that cancel out (correct by primary key). If the commit didn't complete, it's as if the files were never processed.
+- **Iceberg Writer crashes during processing** -- files stuck in "processing" for more than ten minutes are automatically reclaimed on the next startup. If an Iceberg commit completed before the crash, re-processing the same files produces duplicate data files and equality deletes that cancel out (correct by primary key). If the commit didn't complete, it's as if the files were never processed. If the writer crashes after processing some but not all backfill files for a table, the table stays in its current phase and the remaining files are picked up on restart.
 
 - **Source Postgres restarts** -- the replication slot persists. WAL Capture reconnects and resumes from where it left off.
 
@@ -220,7 +258,7 @@ Key settings:
 | Max retries | Failed file processing retry limit | 3 |
 | Cleanup retention | Hours before completed files are deleted | 24 |
 
-Primary keys are auto-detected from the source database on every startup. If a table has no primary key, one can be specified in the configuration.
+Primary keys are auto-detected from the source database catalog on every startup. Every table must have a primary key -- either a constraint on the source table or an explicit override in the configuration file. If Walrus cannot find a primary key for any configured table, the service refuses to start. This is a hard requirement because the entire CDC merge pipeline depends on primary keys for deduplication, upsert resolution, and delete propagation.
 
 ---
 

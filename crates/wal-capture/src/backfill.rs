@@ -169,11 +169,11 @@ async fn backfill_single_table(
     }
 
     metadata
-        .set_table_phase(schema, table, TablePhase::Streaming)
+        .set_table_phase(schema, table, TablePhase::BackfillComplete)
         .await?;
     info!(
         schema,
-        table, "Backfill complete — transitioning to streaming"
+        table, "Backfill export complete — awaiting Iceberg Writer to finish processing"
     );
 
     Ok(())

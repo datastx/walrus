@@ -163,26 +163,16 @@ impl MetadataStore {
             .query_opt(
                 "SELECT table_schema, table_name, phase, \
                  backfill_total_partitions, backfill_done_partitions, \
-                 backfill_snapshot_name, last_committed_lsn::text, \
+                 backfill_snapshot_name, \
+                 writer_backfill_files_done, writer_last_committed_lsn::text, \
+                 streaming_since, \
                  iceberg_schema_version, primary_key_columns \
                  FROM _pgiceberg.table_state \
                  WHERE table_schema = $1 AND table_name = $2",
                 &[&schema, &table],
             )
             .await?;
-        Ok(row.map(|r| TableState {
-            table_schema: r.get(0),
-            table_name: r.get(1),
-            phase: r.get::<_, String>(2).parse().unwrap(),
-            backfill_total_partitions: r.get(3),
-            backfill_done_partitions: r.get(4),
-            backfill_snapshot_name: r.get(5),
-            last_committed_lsn: r
-                .get::<_, Option<String>>(6)
-                .and_then(|s| Lsn::parse(&s).ok()),
-            iceberg_schema_version: r.get(7),
-            primary_key_columns: r.get::<_, Vec<String>>(8),
-        }))
+        Ok(row.map(Self::row_to_table_state))
     }
 
     pub async fn get_all_table_states(&self) -> anyhow::Result<Vec<TableState>> {
@@ -191,28 +181,33 @@ impl MetadataStore {
             .query(
                 "SELECT table_schema, table_name, phase, \
                  backfill_total_partitions, backfill_done_partitions, \
-                 backfill_snapshot_name, last_committed_lsn::text, \
+                 backfill_snapshot_name, \
+                 writer_backfill_files_done, writer_last_committed_lsn::text, \
+                 streaming_since, \
                  iceberg_schema_version, primary_key_columns \
                  FROM _pgiceberg.table_state",
                 &[],
             )
             .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| TableState {
-                table_schema: r.get(0),
-                table_name: r.get(1),
-                phase: r.get::<_, String>(2).parse().unwrap(),
-                backfill_total_partitions: r.get(3),
-                backfill_done_partitions: r.get(4),
-                backfill_snapshot_name: r.get(5),
-                last_committed_lsn: r
-                    .get::<_, Option<String>>(6)
-                    .and_then(|s| Lsn::parse(&s).ok()),
-                iceberg_schema_version: r.get(7),
-                primary_key_columns: r.get::<_, Vec<String>>(8),
-            })
-            .collect())
+        Ok(rows.into_iter().map(Self::row_to_table_state).collect())
+    }
+
+    fn row_to_table_state(r: tokio_postgres::Row) -> TableState {
+        TableState {
+            table_schema: r.get(0),
+            table_name: r.get(1),
+            phase: r.get::<_, String>(2).parse().unwrap(),
+            backfill_total_partitions: r.get(3),
+            backfill_done_partitions: r.get(4),
+            backfill_snapshot_name: r.get(5),
+            writer_backfill_files_done: r.get(6),
+            writer_last_committed_lsn: r
+                .get::<_, Option<String>>(7)
+                .and_then(|s| Lsn::parse(&s).ok()),
+            streaming_since: r.get(8),
+            iceberg_schema_version: r.get(9),
+            primary_key_columns: r.get::<_, Vec<String>>(10),
+        }
     }
 
     pub async fn upsert_table_state(
@@ -280,6 +275,104 @@ impl MetadataStore {
                 "UPDATE _pgiceberg.table_state SET phase = $3, updated_at = now() \
                  WHERE table_schema = $1 AND table_name = $2",
                 &[&schema, &table, &phase_str],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Update only the primary key columns for a table without touching the phase.
+    /// Used during recovery to refresh PK info from pg_index without overwriting
+    /// the persisted lifecycle phase.
+    pub async fn update_pk_columns(
+        &self,
+        schema: &str,
+        table: &str,
+        pk_columns: &[String],
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE _pgiceberg.table_state \
+                 SET primary_key_columns = $3, updated_at = now() \
+                 WHERE table_schema = $1 AND table_name = $2",
+                &[&schema, &table, &pk_columns],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Transition a table from backfill_complete to streaming.
+    ///
+    /// Called by the Iceberg Writer after it has processed all backfill files
+    /// for a table.  Only transitions if:
+    ///   1. The table phase is currently 'backfill_complete'
+    ///   2. No pending or processing backfill files remain in the file_queue
+    ///
+    /// Returns true if the transition was made.
+    pub async fn try_transition_to_streaming(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let result = client
+            .execute(
+                "UPDATE _pgiceberg.table_state \
+                 SET phase = 'streaming', streaming_since = now(), updated_at = now() \
+                 WHERE table_schema = $1 AND table_name = $2 \
+                   AND phase = 'backfill_complete' \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM _pgiceberg.file_queue \
+                     WHERE table_schema = $1 AND table_name = $2 \
+                       AND file_type = 'backfill' \
+                       AND status NOT IN ('completed', 'deleted', 'failed') \
+                   )",
+                &[&schema, &table],
+            )
+            .await?;
+        Ok(result > 0)
+    }
+
+    // ── writer progress ────────────────────────────────────────────
+
+    /// Increment the count of backfill files the writer has committed to Iceberg.
+    /// Called after each successful backfill batch.
+    pub async fn advance_writer_backfill_progress(
+        &self,
+        schema: &str,
+        table: &str,
+        files_done: i32,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE _pgiceberg.table_state \
+                 SET writer_backfill_files_done = writer_backfill_files_done + $3, \
+                     updated_at = now() \
+                 WHERE table_schema = $1 AND table_name = $2",
+                &[&schema, &table, &files_done],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Record the highest CDC LSN the writer has committed to Iceberg.
+    /// Called after each successful CDC batch.
+    pub async fn update_writer_committed_lsn(
+        &self,
+        schema: &str,
+        table: &str,
+        lsn: &Lsn,
+    ) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let lsn_str = lsn.to_string();
+        client
+            .execute(
+                "UPDATE _pgiceberg.table_state \
+                 SET writer_last_committed_lsn = $3::text::pg_lsn, \
+                     updated_at = now() \
+                 WHERE table_schema = $1 AND table_name = $2",
+                &[&schema, &table, &lsn_str],
             )
             .await?;
         Ok(())
@@ -361,7 +454,7 @@ impl MetadataStore {
                    JOIN _pgiceberg.table_state ts USING (table_schema, table_name) \
                    WHERE fq.status = 'pending' \
                      AND ( \
-                       (fq.file_type = 'backfill' AND ts.phase IN ('backfilling', 'streaming')) \
+                       (fq.file_type = 'backfill' AND ts.phase IN ('backfilling', 'backfill_complete')) \
                        OR \
                        (fq.file_type != 'backfill' AND ts.phase = 'streaming' \
                         AND NOT EXISTS ( \
@@ -504,14 +597,15 @@ impl MetadataStore {
         let mut client = self.pool.get().await?;
         let txn = client.transaction().await?;
 
-        // Reset backfilling tables to pending
+        // Reset backfilling and backfill_complete tables to pending
         txn.execute(
             "UPDATE _pgiceberg.table_state \
              SET phase = 'pending', \
                  backfill_done_partitions = 0, \
                  backfill_snapshot_name = NULL, \
+                 writer_backfill_files_done = 0, \
                  updated_at = now() \
-             WHERE phase = 'backfilling'",
+             WHERE phase IN ('backfilling', 'backfill_complete')",
             &[],
         )
         .await?;
@@ -714,10 +808,15 @@ CREATE TABLE IF NOT EXISTS _pgiceberg.table_state (
     table_schema        TEXT NOT NULL,
     table_name          TEXT NOT NULL,
     phase               TEXT NOT NULL DEFAULT 'pending',
+    -- WAL Capture progress: export from source → staging Parquet
     backfill_total_partitions   INT,
     backfill_done_partitions    INT DEFAULT 0,
     backfill_snapshot_name      TEXT,
-    last_committed_lsn          PG_LSN,
+    -- Iceberg Writer progress: staging Parquet → Iceberg table
+    writer_backfill_files_done  INT DEFAULT 0,
+    writer_last_committed_lsn   PG_LSN,
+    streaming_since             TIMESTAMPTZ,
+    -- Shared
     iceberg_schema_version      INT DEFAULT 0,
     primary_key_columns         TEXT[] DEFAULT '{}',
     updated_at                  TIMESTAMPTZ DEFAULT now(),
@@ -759,6 +858,9 @@ CREATE TABLE IF NOT EXISTS _pgiceberg.ddl_events (
     error_message       TEXT
 );
 
--- Idempotent migration for existing installations
+-- Idempotent migrations for existing installations
 ALTER TABLE _pgiceberg.ddl_events ADD COLUMN IF NOT EXISTS target_table TEXT NOT NULL DEFAULT '';
+ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS writer_backfill_files_done INT DEFAULT 0;
+ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS writer_last_committed_lsn PG_LSN;
+ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS streaming_since TIMESTAMPTZ;
 "#;
