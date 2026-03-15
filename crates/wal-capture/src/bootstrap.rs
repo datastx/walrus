@@ -96,10 +96,7 @@ pub async fn drop_replication_slot(config: &SourceConfig) -> anyhow::Result<()> 
     drop_replication_slot_if_exists(&client, &config.slot_name).await
 }
 
-async fn drop_replication_slot_if_exists(
-    client: &Client,
-    slot_name: &str,
-) -> anyhow::Result<()> {
+async fn drop_replication_slot_if_exists(client: &Client, slot_name: &str) -> anyhow::Result<()> {
     let exists: bool = client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
