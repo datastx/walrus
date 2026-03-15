@@ -180,8 +180,7 @@ pub fn write_binary_to_parquet(
         let mut row = Vec::with_capacity(num_fields);
         for _ in 0..num_fields {
             anyhow::ensure!(pos + 4 <= data.len(), "Unexpected end of field length");
-            let len =
-                i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+            let len = i32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
             pos += 4;
             if len == -1 {
                 row.push(None);
@@ -221,24 +220,24 @@ pub fn write_binary_to_parquet(
 /// include a `::text` cast for the column.
 fn wire_type(oid: u32) -> (u32, DataType) {
     match oid {
-        16 => (16, DataType::Boolean),                                    // bool
-        21 => (21, DataType::Int16),                                      // int2
-        23 => (23, DataType::Int32),                                      // int4
-        20 => (20, DataType::Int64),                                      // int8
-        700 => (700, DataType::Float32),                                  // float4
-        701 => (701, DataType::Float64),                                  // float8
-        25 | 1043 => (oid, DataType::Utf8),                               // text / varchar
-        17 => (17, DataType::Binary),                                     // bytea
-        1082 => (1082, DataType::Date32),                                 // date
+        16 => (16, DataType::Boolean),      // bool
+        21 => (21, DataType::Int16),        // int2
+        23 => (23, DataType::Int32),        // int4
+        20 => (20, DataType::Int64),        // int8
+        700 => (700, DataType::Float32),    // float4
+        701 => (701, DataType::Float64),    // float8
+        25 | 1043 => (oid, DataType::Utf8), // text / varchar
+        17 => (17, DataType::Binary),       // bytea
+        1082 => (1082, DataType::Date32),   // date
         1114 => (1114, DataType::Timestamp(TimeUnit::Microsecond, None)), // timestamp
         1184 => (
             1184,
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         ), // timestamptz
-        1083 => (1083, DataType::Time64(TimeUnit::Microsecond)),          // time
-        2950 => (2950, DataType::FixedSizeBinary(16)),                    // uuid
-        114 => (114, DataType::Utf8),                                     // json
-        3802 => (3802, DataType::Utf8),                                   // jsonb
+        1083 => (1083, DataType::Time64(TimeUnit::Microsecond)), // time
+        2950 => (2950, DataType::FixedSizeBinary(16)), // uuid
+        114 => (114, DataType::Utf8),       // json
+        3802 => (3802, DataType::Utf8),     // jsonb
         // Complex types → cast to text in the COPY query
         _ => (25, DataType::Utf8),
     }
@@ -322,7 +321,7 @@ fn parse_binary_column(
         }
         17 => {
             // bytea: raw bytes
-            let v: Vec<Option<&[u8]>> = values.iter().copied().collect();
+            let v: Vec<Option<&[u8]>> = values.to_vec();
             Ok(Arc::new(BinaryArray::from(v)))
         }
         1082 => {
@@ -337,9 +336,7 @@ fn parse_binary_column(
             // timestamp: i64 µs since PG epoch → Unix epoch
             let v: Vec<Option<i64>> = values
                 .iter()
-                .map(|v| {
-                    v.map(|b| i64::from_be_bytes(b[..8].try_into().unwrap()) + PG_EPOCH_USEC)
-                })
+                .map(|v| v.map(|b| i64::from_be_bytes(b[..8].try_into().unwrap()) + PG_EPOCH_USEC))
                 .collect();
             Ok(Arc::new(
                 TimestampMicrosecondArray::from(v).with_timezone_opt(None::<String>),
@@ -349,9 +346,7 @@ fn parse_binary_column(
             // timestamptz: i64 µs since PG epoch → Unix epoch (UTC)
             let v: Vec<Option<i64>> = values
                 .iter()
-                .map(|v| {
-                    v.map(|b| i64::from_be_bytes(b[..8].try_into().unwrap()) + PG_EPOCH_USEC)
-                })
+                .map(|v| v.map(|b| i64::from_be_bytes(b[..8].try_into().unwrap()) + PG_EPOCH_USEC))
                 .collect();
             Ok(Arc::new(
                 TimestampMicrosecondArray::from(v).with_timezone("UTC"),
