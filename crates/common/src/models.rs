@@ -147,6 +147,10 @@ pub struct TableState {
     // ── Shared ──
     pub iceberg_schema_version: i32,
     pub primary_key_columns: Vec<String>,
+    /// True when WAL continuity was broken (slot invalidated) and the table
+    /// needs a full re-export.  The writer drops and recreates the Iceberg
+    /// table before processing backfill files for a resync table.
+    pub needs_resync: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

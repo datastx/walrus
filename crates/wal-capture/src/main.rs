@@ -81,7 +81,22 @@ async fn main() -> anyhow::Result<()> {
         config.source.tls_ca_cert.as_deref(),
     )
     .await?;
-    let slot_info = bootstrap::bootstrap(&config.source, &config.wal_capture, &metadata).await?;
+    let mut slot_info =
+        bootstrap::bootstrap(&config.source, &config.wal_capture, &metadata).await?;
+
+    // ── SLOT VERIFICATION ──
+    //
+    // On recovery (slot_info is None), verify the replication slot still exists
+    // in Postgres.  If it was invalidated (e.g. max_slot_wal_keep_size exceeded)
+    // or dropped by a DBA, we must re-bootstrap everything — including tables
+    // that were already streaming, since the WAL continuity is broken and changes
+    // during the gap would be silently lost.
+    if slot_info.is_none() && !bootstrap::verify_slot_exists(&config.source).await? {
+        tracing::warn!(
+            "Replication slot no longer exists in Postgres — full re-bootstrap required"
+        );
+        slot_info = rebootstrap(&config, &metadata).await?;
+    }
 
     let repl_state = metadata
         .get_replication_state(&config.source.slot_name)
@@ -137,15 +152,8 @@ async fn main() -> anyhow::Result<()> {
                     "No snapshot available for backfill — dropping stale slot and re-bootstrapping"
                 );
 
-                bootstrap::drop_replication_slot(&config.source).await?;
-                metadata.reset_tables_for_rebootstrap().await?;
-                metadata
-                    .delete_replication_state(&config.source.slot_name)
-                    .await?;
-
-                let fresh_slot =
-                    bootstrap::bootstrap(&config.source, &config.wal_capture, &metadata).await?;
-                if let Some(ref slot) = fresh_slot {
+                slot_info = rebootstrap(&config, &metadata).await?;
+                if let Some(ref slot) = slot_info {
                     info!(snapshot = %slot.snapshot_name, "Re-bootstrapped — starting snapshot holder");
                     Some(snapshot::SnapshotHolder::start(
                         config.source.connection_string(),
@@ -272,6 +280,23 @@ fn is_removable_orphan(
     }
     let modified = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
     matches!(modified, Some(t) if t < older_than)
+}
+
+/// Drop the existing slot, reset all table state, and re-bootstrap from scratch.
+///
+/// Streaming tables are flagged with `needs_resync` so the Iceberg Writer knows
+/// to drop and recreate their Iceberg tables before processing the new backfill
+/// data.  This prevents silent data loss from the gap in WAL continuity.
+async fn rebootstrap(
+    config: &AppConfig,
+    metadata: &MetadataStore,
+) -> anyhow::Result<Option<bootstrap::SlotInfo>> {
+    bootstrap::drop_replication_slot(&config.source).await?;
+    metadata.reset_tables_for_rebootstrap().await?;
+    metadata
+        .delete_replication_state(&config.source.slot_name)
+        .await?;
+    bootstrap::bootstrap(&config.source, &config.wal_capture, metadata).await
 }
 
 fn scan_and_remove_orphans(

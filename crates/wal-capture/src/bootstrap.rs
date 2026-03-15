@@ -95,6 +95,30 @@ pub async fn bootstrap(
     Ok(Some(slot_info))
 }
 
+/// Check whether the replication slot actually exists in Postgres.
+///
+/// On recovery, we have persisted replication_state but the slot itself may
+/// have been invalidated (e.g. `max_slot_wal_keep_size` exceeded) or dropped
+/// by a DBA.  If the slot is gone, we need a full re-bootstrap.
+pub async fn verify_slot_exists(config: &SourceConfig) -> anyhow::Result<bool> {
+    let (client, _conn_handle) = tls::pg_connect(
+        &config.connection_string(),
+        &config.tls_mode,
+        config.tls_ca_cert.as_deref(),
+    )
+    .await?;
+
+    let exists: bool = client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+            &[&config.slot_name],
+        )
+        .await?
+        .get(0);
+
+    Ok(exists)
+}
+
 /// Drop a replication slot. Used for recovery when the snapshot has expired.
 pub async fn drop_replication_slot(config: &SourceConfig) -> anyhow::Result<()> {
     let (client, _conn_handle) = tls::pg_connect(

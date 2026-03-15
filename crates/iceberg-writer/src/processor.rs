@@ -2,6 +2,7 @@ use crate::backfill_processor;
 use crate::catalog;
 use crate::cdc_processor;
 use crate::ddl_handler;
+use iceberg::Catalog;
 use iceberg_catalog_sql::SqlCatalog;
 use pgiceberg_common::config::{IcebergWriterConfig, SourceConfig};
 use pgiceberg_common::metadata::MetadataStore;
@@ -87,6 +88,39 @@ pub async fn run_processing_loop(
             pk
         };
 
+        // For resync tables (WAL continuity was broken), drop and recreate
+        // the Iceberg table before processing backfill data.  This ensures
+        // the table starts clean from the new snapshot rather than appending
+        // on top of stale data that may have gaps.
+        let is_backfill = files
+            .iter()
+            .all(|f| f.file_type == pgiceberg_common::models::FileType::Backfill);
+
+        if is_backfill {
+            if let Some(state) = metadata
+                .get_table_state(&files[0].table_schema, &files[0].table_name)
+                .await?
+            {
+                if state.needs_resync {
+                    let namespace = iceberg::NamespaceIdent::new(files[0].table_schema.clone());
+                    let table_ident =
+                        iceberg::TableIdent::new(namespace, files[0].table_name.clone());
+                    if catalog.table_exists(&table_ident).await? {
+                        catalog.drop_table(&table_ident).await?;
+                        info!(
+                            table = %table_key,
+                            "Dropped Iceberg table for resync — will recreate from new snapshot"
+                        );
+                    }
+                    // Clear the flag so we only drop once (subsequent backfill
+                    // batches for this table should append, not drop again).
+                    metadata
+                        .clear_resync_flag(&files[0].table_schema, &files[0].table_name)
+                        .await?;
+                }
+            }
+        }
+
         let mut table = catalog::ensure_iceberg_table(
             catalog,
             metadata,
@@ -98,10 +132,7 @@ pub async fn run_processing_loop(
 
         let file_ids: Vec<uuid::Uuid> = files.iter().map(|f| f.file_id).collect();
 
-        let result = if files
-            .iter()
-            .all(|f| f.file_type == pgiceberg_common::models::FileType::Backfill)
-        {
+        let result = if is_backfill {
             backfill_processor::process_backfill_batch(&mut table, &files, staging_root, catalog)
                 .await
         } else {
