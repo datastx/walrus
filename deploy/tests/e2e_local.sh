@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-COMPOSE="docker compose -f docker/docker-compose.yml"
+COMPOSE="docker compose -f deploy/docker-compose.yml"
 
 echo "=== Starting infrastructure ==="
 $COMPOSE up -d source-postgres

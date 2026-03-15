@@ -2,7 +2,7 @@
        docker-build build-images docker-up docker-down e2e clean ci help
 
 CARGO := cargo
-DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
+DOCKER_COMPOSE := docker compose -f deploy/docker-compose.yml
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -36,8 +36,8 @@ fmt-check: ## Check code formatting
 	$(CARGO) fmt --all -- --check
 
 docker-build: ## Build Docker images for both services
-	docker build -f docker/Dockerfile --target wal-capture -t pgiceberg-wal-capture:latest .
-	docker build -f docker/Dockerfile --target iceberg-writer -t pgiceberg-iceberg-writer:latest .
+	docker build -f deploy/Dockerfile --target wal-capture -t pgiceberg-wal-capture:latest .
+	docker build -f deploy/Dockerfile --target iceberg-writer -t pgiceberg-iceberg-writer:latest .
 
 docker-up: ## Start all services via Docker Compose
 	$(DOCKER_COMPOSE) up -d
@@ -46,14 +46,14 @@ docker-down: ## Stop and remove all Docker Compose services and volumes
 	$(DOCKER_COMPOSE) down -v
 
 e2e: ## Run full end-to-end test
-	bash scripts/run_local.sh
+	bash deploy/tests/e2e_local.sh
 
 build-images: ## Build Docker images tagged :test for K8s testing
-	docker build -f docker/Dockerfile --target wal-capture -t walrus/wal-capture:test .
-	docker build -f docker/Dockerfile --target iceberg-writer -t walrus/iceberg-writer:test .
+	docker build -f deploy/Dockerfile --target wal-capture -t walrus/wal-capture:test .
+	docker build -f deploy/Dockerfile --target iceberg-writer -t walrus/iceberg-writer:test .
 
 test-k8s: build-images ## Run K8s integration test (requires Docker, kind)
-	bash scripts/test_k8s.sh
+	bash deploy/tests/e2e_k8s.sh
 
 ci: fmt-check lint test-unit build ## Run all CI checks locally
 
