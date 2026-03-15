@@ -121,7 +121,7 @@ impl MetadataStore {
             .execute(
                 "INSERT INTO _pgiceberg.replication_state \
                  (slot_name, publication_name, consistent_point, snapshot_name) \
-                 VALUES ($1, $2, $3::pg_lsn, $4) \
+                 VALUES ($1, $2, $3::text::pg_lsn, $4) \
                  ON CONFLICT (slot_name) DO UPDATE SET \
                    consistent_point = EXCLUDED.consistent_point, \
                    snapshot_name = EXCLUDED.snapshot_name, \
@@ -143,7 +143,7 @@ impl MetadataStore {
         client
             .execute(
                 "UPDATE _pgiceberg.replication_state \
-                 SET last_flushed_lsn = $2::pg_lsn, updated_at = now() \
+                 SET last_flushed_lsn = $2::text::pg_lsn, updated_at = now() \
                  WHERE slot_name = $1",
                 &[&slot_name, &lsn_str],
             )
@@ -297,7 +297,7 @@ impl MetadataStore {
                 "INSERT INTO _pgiceberg.file_queue \
                  (table_schema, table_name, file_type, file_path, \
                   lsn_low, lsn_high, row_count, partition_id, status) \
-                 VALUES ($1, $2, $3, $4, $5::pg_lsn, $6::pg_lsn, $7, $8, 'pending') \
+                 VALUES ($1, $2, $3, $4, $5::text::pg_lsn, $6::text::pg_lsn, $7, $8, 'pending') \
                  RETURNING file_id",
                 &[
                     &params.schema,
@@ -327,7 +327,7 @@ impl MetadataStore {
             "INSERT INTO _pgiceberg.file_queue \
              (table_schema, table_name, file_type, file_path, \
               lsn_low, lsn_high, row_count, status) \
-             VALUES ($1, $2, 'cdc_mixed', $3, $4::pg_lsn, $5::pg_lsn, $6, 'pending')",
+             VALUES ($1, $2, 'cdc_mixed', $3, $4::text::pg_lsn, $5::text::pg_lsn, $6, 'pending')",
             &[
                 &params.schema,
                 &params.table,
@@ -340,7 +340,7 @@ impl MetadataStore {
         .await?;
         txn.execute(
             "UPDATE _pgiceberg.replication_state \
-             SET last_flushed_lsn = $2::pg_lsn, updated_at = now() \
+             SET last_flushed_lsn = $2::text::pg_lsn, updated_at = now() \
              WHERE slot_name = $1",
             &[&params.slot_name, &lsn_high_str],
         )

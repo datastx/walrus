@@ -228,7 +228,7 @@ Primary keys are auto-detected from the source database on every startup. If a t
 
 Walrus is designed for Kubernetes:
 
-- **WAL Capture** runs as a single-replica Deployment with Recreate strategy (only one instance can consume a replication slot).
+- **WAL Capture** runs as a single-replica StatefulSet with a headless Service. A StatefulSet guarantees ordered pod termination -- the old pod is fully shut down before a replacement starts -- preventing split-brain WAL consumption that would cause duplicate or lost data.
 - **Iceberg Writer** runs as a Deployment that can potentially scale to multiple replicas (file queue claiming is atomic and per-table).
 - Both services expose health check endpoints for liveness and readiness probes.
 - The staging directory is a ReadWriteMany PVC (EFS, NFS, or similar).

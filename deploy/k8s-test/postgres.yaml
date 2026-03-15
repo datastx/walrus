@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: walrus
+data:
+  init.sql: |
+    CREATE TABLE public.users (
+        id          SERIAL PRIMARY KEY,
+        name        TEXT NOT NULL,
+        email       TEXT,
+        created_at  TIMESTAMPTZ DEFAULT now(),
+        metadata    JSONB
+    );
+
+    CREATE TABLE public.orders (
+        id          SERIAL PRIMARY KEY,
+        user_id     INT REFERENCES public.users(id),
+        amount      NUMERIC(10, 2) NOT NULL,
+        status      TEXT DEFAULT 'pending',
+        ordered_at  TIMESTAMPTZ DEFAULT now()
+    );
+
+    CREATE TABLE public.products (
+        product_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        name        TEXT NOT NULL,
+        price       NUMERIC(10, 2),
+        tags        TEXT[],
+        description TEXT
+    );
+
+    INSERT INTO public.users (name, email, metadata)
+    SELECT
+        'user_' || i,
+        'user_' || i || '@example.com',
+        jsonb_build_object('tier', CASE WHEN i % 3 = 0 THEN 'gold' ELSE 'silver' END)
+    FROM generate_series(1, 100) AS i;
+
+    INSERT INTO public.orders (user_id, amount, status)
+    SELECT
+        (i % 100) + 1,
+        round((random() * 1000)::numeric, 2),
+        CASE (i % 4) WHEN 0 THEN 'pending' WHEN 1 THEN 'shipped'
+                     WHEN 2 THEN 'delivered' ELSE 'cancelled' END
+    FROM generate_series(1, 500) AS i;
+
+    INSERT INTO public.products (name, price, tags, description)
+    SELECT
+        'product_' || i,
+        round((random() * 500)::numeric, 2),
+        ARRAY['tag_' || (i % 5), 'tag_' || (i % 10)],
+        'test product description'
+    FROM generate_series(1, 50) AS i;
+
+    ALTER USER replicator WITH REPLICATION;
+    GRANT SELECT ON ALL TABLES IN SCHEMA public TO replicator;
+    GRANT USAGE ON SCHEMA public TO replicator;
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: walrus
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: walrus
+    app.kubernetes.io/component: database
+spec:
+  replicas: 1
+  serviceName: postgres
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/part-of: walrus
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: walrus
+        app.kubernetes.io/component: database
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          args:
+            - postgres
+            - -c
+            - wal_level=logical
+            - -c
+            - max_replication_slots=10
+            - -c
+            - max_wal_senders=10
+          env:
+            - name: POSTGRES_DB
+              value: sourcedb
+            - name: POSTGRES_USER
+              value: replicator
+            - name: POSTGRES_PASSWORD
+              value: testpass
+          ports:
+            - name: pg
+              containerPort: 5432
+              protocol: TCP
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - replicator
+                - -d
+                - sourcedb
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          volumeMounts:
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+              readOnly: true
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: postgres-init
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: walrus
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: walrus
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: walrus
+  ports:
+    - name: pg
+      port: 5432
+      targetPort: pg
+      protocol: TCP

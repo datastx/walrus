@@ -1,5 +1,5 @@
-.PHONY: build check test test-unit test-integration lint fmt fmt-check \
-       docker-build docker-up docker-down e2e clean ci help
+.PHONY: build check test test-unit test-integration test-k8s lint fmt fmt-check \
+       docker-build build-images docker-up docker-down e2e clean ci help
 
 CARGO := cargo
 DOCKER_COMPOSE := docker compose -f docker/docker-compose.yml
@@ -47,6 +47,13 @@ docker-down: ## Stop and remove all Docker Compose services and volumes
 
 e2e: ## Run full end-to-end test
 	bash scripts/run_local.sh
+
+build-images: ## Build Docker images tagged :test for K8s testing
+	docker build -f docker/Dockerfile --target wal-capture -t walrus/wal-capture:test .
+	docker build -f docker/Dockerfile --target iceberg-writer -t walrus/iceberg-writer:test .
+
+test-k8s: build-images ## Run K8s integration test (requires Docker, kind)
+	bash scripts/test_k8s.sh
 
 ci: fmt-check lint test-unit build ## Run all CI checks locally
 

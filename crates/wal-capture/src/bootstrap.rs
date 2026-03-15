@@ -39,7 +39,7 @@ pub async fn bootstrap(
 
     info!(slot = %config.slot_name, "No existing state — fresh bootstrap");
 
-    let (client, _conn_handle) = tls::pg_connect(
+    let (mut client, _conn_handle) = tls::pg_connect(
         &config.connection_string(),
         &config.tls_mode,
         config.tls_ca_cert.as_deref(),
@@ -47,7 +47,12 @@ pub async fn bootstrap(
     .await?;
 
     ensure_publication(&client, config).await?;
-    let slot_info = create_replication_slot(&client, config).await?;
+
+    // A previous crash may have created the slot without saving state.
+    // Drop it so we can recreate with a fresh snapshot.
+    drop_replication_slot_if_exists(&client, &config.slot_name).await?;
+
+    let slot_info = create_replication_slot(&mut client, config).await?;
     bootstrap_ddl_audit(&client, config).await?;
 
     metadata
@@ -88,19 +93,26 @@ pub async fn drop_replication_slot(config: &SourceConfig) -> anyhow::Result<()> 
     )
     .await?;
 
+    drop_replication_slot_if_exists(&client, &config.slot_name).await
+}
+
+async fn drop_replication_slot_if_exists(
+    client: &Client,
+    slot_name: &str,
+) -> anyhow::Result<()> {
     let exists: bool = client
         .query_one(
             "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
-            &[&config.slot_name],
+            &[&slot_name],
         )
         .await?
         .get(0);
 
     if exists {
         client
-            .execute("SELECT pg_drop_replication_slot($1)", &[&config.slot_name])
+            .execute("SELECT pg_drop_replication_slot($1)", &[&slot_name])
             .await?;
-        info!(slot = %config.slot_name, "Dropped stale replication slot");
+        info!(slot = %slot_name, "Dropped stale replication slot");
     }
     Ok(())
 }
@@ -161,18 +173,31 @@ async fn sync_publication_tables(client: &Client, config: &SourceConfig) -> anyh
 }
 
 async fn create_replication_slot(
-    client: &Client,
+    client: &mut Client,
     config: &SourceConfig,
 ) -> anyhow::Result<SlotInfo> {
-    let row = client
+    // Must run in a transaction: pg_export_snapshot() captures the snapshot
+    // from pg_create_logical_replication_slot() only within the same transaction.
+    // Note: pg_create_logical_replication_slot() dropped the snapshot_name output
+    // column in PostgreSQL 14+, so we use pg_export_snapshot() instead.
+    let tx = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+
+    let row = tx
         .query_one(
-            "SELECT lsn::text, snapshot_name FROM pg_create_logical_replication_slot($1, 'pgoutput')",
+            "SELECT lsn::text FROM pg_create_logical_replication_slot($1, 'pgoutput')",
             &[&config.slot_name],
         )
         .await?;
-
     let consistent_point: String = row.get(0);
-    let snapshot_name: String = row.get(1);
+
+    let snap_row = tx.query_one("SELECT pg_export_snapshot()", &[]).await?;
+    let snapshot_name: String = snap_row.get(0);
+
+    tx.commit().await?;
 
     info!(
         slot = %config.slot_name,

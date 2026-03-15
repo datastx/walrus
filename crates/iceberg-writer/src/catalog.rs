@@ -14,7 +14,7 @@ pub async fn init_catalog(config: &IcebergWriterConfig) -> anyhow::Result<SqlCat
     std::fs::create_dir_all(&config.warehouse_path)?;
 
     let catalog = SqlCatalogBuilder::default()
-        .uri(format!("sqlite://{}", config.catalog_db_path.display()))
+        .uri(format!("sqlite://{}?mode=rwc", config.catalog_db_path.display()))
         .warehouse_location(format!("file://{}", config.warehouse_path.display()))
         .load("pgiceberg", HashMap::new())
         .await?;

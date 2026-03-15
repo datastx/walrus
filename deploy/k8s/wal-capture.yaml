@@ -1,5 +1,5 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: wal-capture
   namespace: walrus
@@ -11,11 +11,16 @@ metadata:
 spec:
   # WAL Capture MUST run as a single replica.
   # Only one instance can consume a Postgres logical replication slot.
+  # A StatefulSet (rather than Deployment) enforces singleton semantics:
+  # the old pod is fully terminated before a replacement starts, preventing
+  # split-brain WAL consumption that would cause data corruption.
   replicas: 1
-  strategy:
-    # Recreate ensures the old pod is fully terminated before the new one starts,
-    # preventing split-brain WAL consumption.
-    type: Recreate
+  serviceName: wal-capture
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      partition: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: wal-capture
@@ -133,7 +138,7 @@ metadata:
     app.kubernetes.io/component: wal-capture
     app.kubernetes.io/managed-by: kustomize
 spec:
-  type: ClusterIP
+  clusterIP: None
   selector:
     app.kubernetes.io/name: wal-capture
     app.kubernetes.io/part-of: walrus

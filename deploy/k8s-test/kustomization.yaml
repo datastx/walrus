@@ -1,0 +1,121 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: walrus
+
+resources:
+  - ../k8s
+  - postgres.yaml
+
+patches:
+  # --- WAL Capture: point at in-cluster Postgres, use test image ---
+  - target:
+      kind: StatefulSet
+      name: wal-capture
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: walrus/wal-capture:test
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: replace
+        path: /spec/template/spec/containers/0/env/0/value
+        value: "postgres"
+      - op: replace
+        path: /spec/template/spec/containers/0/env/7/value
+        value: "disable"
+
+  # --- Iceberg Writer: point at in-cluster Postgres, use test image ---
+  - target:
+      kind: Deployment
+      name: iceberg-writer
+    patch: |
+      - op: replace
+        path: /spec/template/spec/containers/0/image
+        value: walrus/iceberg-writer:test
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      - op: replace
+        path: /spec/template/spec/containers/0/env/0/value
+        value: "postgres"
+      - op: replace
+        path: /spec/template/spec/containers/0/env/5/value
+        value: "disable"
+
+  # --- PVCs: RWX -> RWO (kind doesn't support RWX), smaller size ---
+  - target:
+      kind: PersistentVolumeClaim
+      name: staging-data
+    patch: |
+      - op: replace
+        path: /spec/accessModes
+        value: ["ReadWriteOnce"]
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: "1Gi"
+
+  - target:
+      kind: PersistentVolumeClaim
+      name: warehouse-data
+    patch: |
+      - op: replace
+        path: /spec/accessModes
+        value: ["ReadWriteOnce"]
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: "1Gi"
+
+  # --- Secret: use test password ---
+  - target:
+      kind: Secret
+      name: pgiceberg-secret
+    patch: |
+      - op: replace
+        path: /stringData/PG_PASSWORD
+        value: "testpass"
+
+  # --- ConfigMap: point config at in-cluster Postgres ---
+  - target:
+      kind: ConfigMap
+      name: pgiceberg-config
+    patch: |
+      - op: replace
+        path: /data/pgiceberg.toml
+        value: |
+          [source]
+          host = "postgres"
+          port = 5432
+          database = "sourcedb"
+          user = "replicator"
+          password_env = "PG_PASSWORD"
+          slot_name = "pgiceberg_slot"
+          publication_name = "pgiceberg_pub"
+
+          [source.tables]
+          "public.users" = {}
+          "public.orders" = {}
+          "public.products" = { pk = ["product_id"] }
+
+          [staging]
+          root = "/data/staging"
+          cleanup_after_hours = 24
+
+          [wal_capture]
+          max_parallel_tables = 4
+          max_parallel_workers_per_table = 2
+          rows_per_partition = 500_000
+          max_batch_rows = 50_000
+          max_batch_bytes = 67_108_864
+          flush_interval_seconds = 30
+          idle_timeout_seconds = 60
+
+          [iceberg_writer]
+          warehouse_path = "/data/iceberg"
+          catalog_db_path = "/data/iceberg/catalog.db"
+          poll_interval_seconds = 5
+          max_files_per_batch = 100
+          compaction_interval_hours = 6
+          compaction_delete_threshold = 50
+          max_retries = 3
