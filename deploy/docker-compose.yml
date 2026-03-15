@@ -19,7 +19,7 @@ services:
       - "5432:5432"
     volumes:
       - source-pgdata:/var/lib/postgresql/data
-      - ../scripts/setup_source_db.sql:/docker-entrypoint-initdb.d/01-setup.sql
+      - ./setup_source_db.sql:/docker-entrypoint-initdb.d/01-setup.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U replicator -d sourcedb"]
       interval: 5s
@@ -28,7 +28,7 @@ services:
   wal-capture:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
+      dockerfile: deploy/Dockerfile
       target: wal-capture
     environment:
       PG_HOST: source-postgres
@@ -48,7 +48,7 @@ services:
   iceberg-writer:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
+      dockerfile: deploy/Dockerfile
       target: iceberg-writer
     environment:
       PG_HOST: source-postgres
