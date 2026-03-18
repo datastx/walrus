@@ -38,7 +38,7 @@ pub async fn process_cdc_batch(
     let upsert_path = temp_dir.path().join("upsert.parquet");
     let delete_path = temp_dir.path().join("delete_keys.parquet");
 
-    let file_paths: Vec<String> = files
+    let all_paths: Vec<String> = files
         .iter()
         .map(|f| {
             staging_root
@@ -46,12 +46,32 @@ pub async fn process_cdc_batch(
                 .to_string_lossy()
                 .to_string()
         })
+        .collect();
+
+    let missing_count = all_paths.iter().filter(|p| !Path::new(p).exists()).count();
+    if missing_count > 0 {
+        tracing::warn!(
+            missing = missing_count,
+            total = all_paths.len(),
+            "Some CDC staging files are missing on disk"
+        );
+    }
+
+    let file_paths: Vec<String> = all_paths
+        .into_iter()
         .filter(|p| Path::new(p).exists())
         .collect();
 
     if file_paths.is_empty() {
-        tracing::warn!("No CDC files found on disk — skipping batch");
-        return Ok(());
+        // All files missing — this is data loss, not a no-op. Return error
+        // so the batch is retried or flagged as failed instead of silently
+        // marked completed with no data written.
+        anyhow::bail!(
+            "All {} CDC staging files are missing for {}.{} — refusing to mark batch completed",
+            files.len(),
+            files[0].table_schema,
+            files[0].table_name
+        );
     }
 
     let pk_cols = pk_columns.to_vec();

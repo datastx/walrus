@@ -36,8 +36,15 @@ pub async fn run_processing_loop(
     let mut last_reclaim = Instant::now();
 
     let mut pk_cache: HashMap<String, Vec<String>> = HashMap::new();
+    let pk_cache_ttl = Duration::from_secs(3600); // refresh PK cache every hour
+    let mut pk_cache_last_refresh = Instant::now();
 
     loop {
+        // Periodically invalidate the PK cache so ALTER TABLE changes are picked up
+        if pk_cache_last_refresh.elapsed() >= pk_cache_ttl {
+            pk_cache.clear();
+            pk_cache_last_refresh = Instant::now();
+        }
         if *shutdown_rx.borrow() {
             info!("Shutdown signal — stopping processing loop");
             break;

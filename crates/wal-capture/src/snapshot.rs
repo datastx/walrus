@@ -61,7 +61,22 @@ async fn hold_snapshot(
 
     info!(snapshot = snapshot_name, "Snapshot holder active");
 
-    let _ = cancel_rx.changed().await;
+    // Periodically run a no-op query to prevent idle_in_transaction_session_timeout
+    // from killing the snapshot-holding session.
+    let mut keepalive_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = cancel_rx.changed() => break,
+            _ = keepalive_interval.tick() => {
+                if let Err(e) = client.batch_execute("SELECT 1").await {
+                    warn!("Snapshot holder keepalive failed: {} — snapshot may be lost", e);
+                    return Err(e.into());
+                }
+            }
+        }
+    }
 
     client.batch_execute("COMMIT").await?;
     Ok(())

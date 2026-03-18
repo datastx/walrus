@@ -56,11 +56,13 @@ pub async fn process_resync(
         });
     }
 
-    // Get existing Iceberg data file paths from the current snapshot
-    let old_file_paths = get_existing_data_file_paths(table).await?;
+    // Get existing Iceberg data + delete file paths from the current snapshot.
+    // We need both to correctly compute the diff: equality deletes must be
+    // anti-joined against data files to get the true current state.
+    let (old_data_paths, old_delete_paths) = get_existing_file_paths(table).await?;
 
     // If no existing data, all backfill data is new — fast_append like normal backfill
-    if old_file_paths.is_empty() {
+    if old_data_paths.is_empty() {
         info!("No existing Iceberg data files — treating resync as initial backfill append");
         let row_count = append_backfill_files(table, &new_file_paths, catalog).await?;
         return Ok(ResyncResult {
@@ -79,7 +81,7 @@ pub async fn process_resync(
     let (upsert_count, delete_count) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, u64)> {
             let engine = DuckDbEngine::new()?;
-            engine.load_resync_data(&old_file_paths, &new_file_paths)?;
+            engine.load_resync_data_with_deletes(&old_data_paths, &old_delete_paths, &new_file_paths, &pk_cols)?;
             engine.compute_resync_diff(&pk_cols)?;
             let uc = engine.export_upserts(&up)?;
             let dc = engine.export_deletes(&dp)?;
@@ -187,16 +189,17 @@ pub async fn process_resync(
     })
 }
 
-/// Extract existing data file paths from the current Iceberg snapshot.
+/// Extract existing data and delete file paths from the current Iceberg snapshot.
 ///
-/// Uses the manifest list to find all data files (excluding delete files).
-/// Strips the `file://` prefix since the warehouse uses local filesystem
-/// and DuckDB needs raw filesystem paths.
-async fn get_existing_data_file_paths(table: &Table) -> anyhow::Result<Vec<String>> {
+/// Returns `(data_files, delete_files)` with `file://` prefix stripped for
+/// DuckDB compatibility. The delete files must be applied (anti-joined) against
+/// the data files to get the true current state. Without this, "deleted" rows
+/// still present in data files would appear in the resync diff.
+async fn get_existing_file_paths(table: &Table) -> anyhow::Result<(Vec<String>, Vec<String>)> {
     let metadata = table.metadata();
     let snapshot = match metadata.current_snapshot() {
         Some(s) => s,
-        None => return Ok(Vec::new()),
+        None => return Ok((Vec::new(), Vec::new())),
     };
 
     let manifest_list = snapshot
@@ -204,23 +207,26 @@ async fn get_existing_data_file_paths(table: &Table) -> anyhow::Result<Vec<Strin
         .await?;
 
     let mut data_file_paths = Vec::new();
+    let mut delete_file_paths = Vec::new();
     for entry in manifest_list.entries() {
         let manifest = entry.load_manifest(table.file_io()).await?;
         for manifest_entry in manifest.entries() {
-            if entry.content == ManifestContentType::Data {
-                let path = manifest_entry.data_file().file_path().to_string();
-                let local_path = if let Some(stripped) = path.strip_prefix("file://") {
-                    stripped.to_string()
-                } else {
-                    path
-                };
-                data_file_paths.push(local_path);
+            let path = manifest_entry.data_file().file_path().to_string();
+            let local_path = if let Some(stripped) = path.strip_prefix("file://") {
+                stripped.to_string()
+            } else {
+                path
+            };
+            match entry.content {
+                ManifestContentType::Data => data_file_paths.push(local_path),
+                ManifestContentType::Deletes => delete_file_paths.push(local_path),
             }
         }
     }
 
-    Ok(data_file_paths)
+    Ok((data_file_paths, delete_file_paths))
 }
+
 
 /// Append backfill files directly (used when there are no existing Iceberg data files).
 async fn append_backfill_files(

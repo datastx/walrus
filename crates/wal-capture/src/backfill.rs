@@ -127,7 +127,8 @@ async fn backfill_single_table(
 
     let row = client
         .query_one(
-            "SELECT COALESCE(relpages, 0)::bigint, GREATEST(reltuples, 0)::float8 \
+            "SELECT COALESCE(relpages, 0)::bigint, GREATEST(reltuples, 0)::float8, \
+             c.relkind \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relname = $1 AND n.nspname = $2",
             &[&table, &schema],
@@ -136,6 +137,18 @@ async fn backfill_single_table(
 
     let relpages: i64 = row.get(0);
     let reltuples: f64 = row.get(1);
+    let relkind: String = row.get(2);
+
+    // Partitioned parent tables (relkind = 'p') have relpages=0 and reltuples=0
+    // because data lives in child partitions. CTID scans on the parent yield no rows.
+    if relkind == "p" {
+        tracing::warn!(
+            schema,
+            table,
+            "Table is a partitioned parent — CTID backfill will export 0 rows. \
+             Configure individual child partitions in [source.tables] instead."
+        );
+    }
     let rows_per_page = if relpages > 0 {
         reltuples / relpages as f64
     } else {

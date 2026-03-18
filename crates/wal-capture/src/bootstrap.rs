@@ -46,6 +46,11 @@ pub async fn bootstrap(
     if existing.is_some() {
         info!(slot = %config.slot_name, "Found existing replication state — recovering");
         refresh_pk_columns(config, metadata).await?;
+
+        // Register any newly configured tables that weren't in the original bootstrap.
+        // Without this, tables added to the config after initial setup are silently ignored.
+        register_new_tables(config, wal_config, metadata).await?;
+
         return Ok(None);
     }
 
@@ -381,6 +386,55 @@ async fn compute_partitions(
 
     let total = (relpages as u64).max(1).div_ceil(pages_per_partition);
     Ok(total.max(1))
+}
+
+/// Register tables that are in the config but don't have a table_state row yet.
+/// This handles the case where new tables are added to the config after the initial
+/// bootstrap. They get added to the publication and registered as pending for backfill.
+async fn register_new_tables(
+    config: &SourceConfig,
+    wal_config: &WalCaptureConfig,
+    metadata: &MetadataStore,
+) -> anyhow::Result<()> {
+    // Ensure publication includes all configured tables
+    {
+        let (client, _conn_handle) = tls::pg_connect(
+            &config.connection_string(),
+            &config.tls_mode,
+            config.tls_ca_cert.as_deref(),
+        )
+        .await?;
+        sync_publication_tables(&client, config).await?;
+    }
+
+    for (schema, table) in config.table_list() {
+        let existing = metadata.get_table_state(&schema, &table).await?;
+        if existing.is_none() {
+            let pk_cols = discover_or_config_pk(config, metadata, &schema, &table).await?;
+
+            let (client, _conn_handle) = tls::pg_connect(
+                &config.connection_string(),
+                &config.tls_mode,
+                config.tls_ca_cert.as_deref(),
+            )
+            .await?;
+            let partitions =
+                compute_partitions(&client, &schema, &table, wal_config.rows_per_partition).await?;
+
+            metadata
+                .upsert_table_state(
+                    &schema,
+                    &table,
+                    TablePhase::Pending,
+                    Some(partitions as i32),
+                    None,
+                    &pk_cols,
+                )
+                .await?;
+            info!(schema, table, "Registered new table from config (requires re-bootstrap for backfill)");
+        }
+    }
+    Ok(())
 }
 
 /// Re-discover PKs from pg_index for all configured tables on startup.
