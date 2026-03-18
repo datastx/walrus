@@ -35,13 +35,13 @@ First, the service ensures the metadata schema and its four tables exist in the 
 
 Second, it verifies that the DDL audit infrastructure is installed on the source database. This includes the audit table, the event trigger function, and the event trigger itself. These objects could have been dropped by a DBA or lost during a database restore, so Walrus checks and recreates them on every startup rather than assuming they survived from the original bootstrap.
 
-Third, it checks whether a replication slot and its associated state already exist. If they do, this is a recovery scenario and the service picks up where it left off. If they do not, this is a fresh start and the service creates a new logical replication slot, captures a snapshot identifier for the initial export, and persists both the slot position and the snapshot name to the replication state table. Persisting the snapshot name is essential for crash recovery: if the service goes down mid-backfill and comes back up, it needs the original snapshot to resume the export from the exact point-in-time it started with.
+Third, it gathers metadata about every table it has been configured to replicate. The most important piece of metadata is the primary key. Walrus discovers primary keys from the source database catalog on every startup so it never relies on stale cached information. If a table has no primary key constraint and none is specified in the configuration file, the service refuses to start. A primary key is non-negotiable because the entire CDC merge pipeline depends on it for deduplication, upsert resolution, and delete propagation. Without one, data in the Iceberg table would silently diverge from the source.
+
+Fourth, it reconciles the configured tables against the table state metadata to understand where each table is in its lifecycle. A table might be pending its first export, actively backfilling, finished exporting but waiting for the Iceberg Writer to absorb the data, or fully streaming. New tables are registered while existing tables keep their current phase. This determines which of the concurrent tasks need to run.
+
+Fifth, it checks whether a replication slot and its associated state already exist. If they do, this is a recovery scenario and the service picks up where it left off. If they do not, this is a fresh start and the service creates a new logical replication slot, captures a snapshot identifier for the initial export, and persists both the slot position and the snapshot name to the replication state table. Persisting the snapshot name is essential for crash recovery: if the service goes down mid-backfill and comes back up, it needs the original snapshot to resume the export from the exact point-in-time it started with.
 
 On recovery, the service also verifies that the replication slot actually still exists in the source database. The metadata might say a slot exists, but Postgres could have invalidated it while the service was down — for example, if WAL retention limits were exceeded and the database decided to discard the slot rather than let disk fill up. If the slot is gone, the service cannot simply resume from where it left off because there is a gap in the change history. Any changes that happened between the last confirmed position and now are lost from the slot's perspective. Walrus detects this condition and triggers a full re-bootstrap, which is described in detail in the Crash Recovery section below.
-
-Fourth, it gathers metadata about every table it has been configured to replicate. The most important piece of metadata is the primary key. Walrus discovers primary keys from the source database catalog on every startup so it never relies on stale cached information. If a table has no primary key constraint and none is specified in the configuration file, the service refuses to start. A primary key is non-negotiable because the entire CDC merge pipeline depends on it for deduplication, upsert resolution, and delete propagation. Without one, data in the Iceberg table would silently diverge from the source.
-
-Finally, it checks the table state metadata to understand where each table is in its lifecycle. A table might be pending its first export, actively backfilling, finished exporting but waiting for the Iceberg Writer to absorb the data, or fully streaming. This determines which of the concurrent tasks need to run.
 
 ---
 
@@ -199,9 +199,58 @@ Operators should be aware that a resync can happen whenever the service is down 
 
 ## DDL Change Propagation
 
-Postgres does not replicate DDL (schema changes) through logical replication. Walrus works around this using an event trigger on the source database that captures DDL statements into an audit table. The audit table is included in the replication publication, so its inserts appear in the WAL stream.
+Postgres does not replicate DDL (schema changes) through logical replication. Walrus works around this using an event trigger on the source database that captures DDL statements into an audit table. The audit table is included in the replication publication, so its inserts appear in the WAL stream alongside regular CDC data.
 
-When WAL Capture sees an insert into the audit table, it extracts the DDL metadata (what kind of change, which table, the SQL statement) and writes it to the DDL events table in the metadata store. The Iceberg Writer checks for pending DDL events before processing data files and applies schema changes to the Iceberg table (add column, drop column, type changes) before any data that depends on the new schema arrives.
+### LSN-Ordered DDL Capture
+
+DDL events and CDC data share the same WAL stream, so they have a natural ordering by LSN (log sequence number). Walrus exploits this to ensure schema changes are applied to Iceberg before any data that depends on them.
+
+When WAL Capture sees an insert into the DDL audit table, it does not immediately write the event to the metadata store. Instead, it buffers the DDL event alongside the other records in the in-flight transaction. When the transaction commits, the commit LSN is known, and Walrus flushes the DDL event to the metadata store with that LSN attached. This deferred flush is essential: at the time the audit row arrives, the transaction has not committed yet and no LSN is available, so writing the event at that point would leave the ordering key empty.
+
+### Per-Table DDL Blocking
+
+A CDC file whose LSN range follows a DDL event contains post-DDL data — rows that may reference a newly added column, for example. If that CDC file is processed before the DDL event is applied to Iceberg, the Iceberg table is missing the column and data is corrupt or lost.
+
+Walrus prevents this by gating CDC file eligibility on DDL status. When the Iceberg Writer selects the next batch of files to process, a CDC file is only eligible if there are no unapplied DDL events for the same table with an earlier LSN. If such an event exists, the file is blocked until the DDL is resolved. DDL events without a captured LSN (an edge case) conservatively block all CDC files for that table.
+
+This blocking is per-table. A pending DDL event on `orders` does not prevent the writer from processing CDC files for `customers` or any other table. Backfill files are also unaffected — DDL events only matter during streaming because the backfill snapshot predates the DDL.
+
+### DDL Event Status Lifecycle
+
+DDL events move through a status lifecycle rather than a simple applied/not-applied flag:
+
+- **Pending** — detected in the WAL stream and written to the metadata store, but not yet applied to Iceberg. Blocks CDC files for the affected table whose LSN follows the DDL.
+- **Applying** — the Iceberg Writer has claimed this event and is actively applying it. This is a crash guard: if the writer crashes mid-application, events stuck in this state for more than ten minutes are reset to pending on the next startup.
+- **Applied** — the schema change was successfully committed to the Iceberg table. No longer blocks anything.
+- **Failed** — the schema change could not be applied. The table's CDC files remain blocked until an operator resolves the issue. A failed DDL is never auto-resolved.
+- **Skipped** — the DDL type does not require an Iceberg schema change (e.g., CREATE TABLE, RENAME TABLE, index operations). Treated the same as applied for blocking purposes.
+
+### How the Iceberg Writer Processes DDL
+
+On each poll iteration, the Iceberg Writer processes DDL events per-table and oldest-first, with proper status transitions through the lifecycle above:
+
+1. **Apply pending DDL events** — for each table with pending events, claim the oldest event, attempt the schema change, and transition to applied or failed. Events are processed one at a time per table to maintain ordering.
+2. **Claim next file batch** — the file eligibility check includes the DDL gate. Tables with unresolved DDL events simply produce no eligible CDC files, so no additional coordination is needed.
+
+### DDL During Backfill
+
+DDL events that arrive while a table is still backfilling are queued as pending in the metadata store. They do not block backfill file processing because backfill data predates the DDL. When the table transitions to streaming, the writer processes the queued DDL events before any CDC files become eligible. This happens naturally because the DDL gate applies only to CDC files, and the writer processes pending DDL events on every poll iteration.
+
+### Failure Handling and Operator Resolution
+
+When a DDL event fails, the table's CDC pipeline is blocked until an operator resolves the situation. A timestamp on the table state records when blocking began, so operators can see affected tables at a glance. Operators have three options:
+
+- **Fix and retry** — correct the underlying issue (e.g., a type incompatibility) and reset the event status to pending. The writer will re-attempt the schema change on its next poll.
+- **Skip** — mark the event as skipped if the DDL is not relevant to the Iceberg table. The CDC pipeline resumes immediately.
+- **Manually apply** — apply the schema change to Iceberg directly (e.g., via a SQL engine or the Iceberg API) and then mark the event as applied.
+
+### Crash Recovery
+
+DDL processing follows the same crash recovery patterns as the rest of the system:
+
+- Events stuck in the applying state for more than ten minutes are reset to pending, matching the same reclaim pattern used for stuck file processing.
+- DDL application is idempotent where possible (e.g., adding a column only if it does not already exist), so re-processing after a crash is safe.
+- Failed events are never auto-resolved — they require operator intervention.
 
 ---
 

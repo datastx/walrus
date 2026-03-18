@@ -73,6 +73,22 @@ pub async fn process_ddl_events(
     info!(count = events.len(), "Processing pending DDL events");
 
     for event in &events {
+        // Crash guard: claim before processing
+        if !metadata.claim_ddl_event(event.event_id).await? {
+            continue; // Already claimed by another instance
+        }
+
+        // Skip irrelevant DDL types
+        if should_skip_ddl(&event.ddl_tag) {
+            metadata.mark_ddl_skipped(event.event_id).await?;
+            info!(
+                event_id = event.event_id,
+                tag = %event.ddl_tag,
+                "DDL event skipped — not relevant to Iceberg schema"
+            );
+            continue;
+        }
+
         match process_single_event(event, catalog).await {
             Ok(()) => {
                 metadata.mark_ddl_applied(event.event_id).await?;
@@ -87,9 +103,11 @@ pub async fn process_ddl_events(
                     event_id = event.event_id,
                     tag = %event.ddl_tag,
                     error = %e,
-                    "DDL event failed — marking as applied to avoid blocking"
+                    "DDL event failed — table CDC pipeline blocked until resolved"
                 );
-                metadata.mark_ddl_applied(event.event_id).await?;
+                metadata
+                    .mark_ddl_failed(event.event_id, &e.to_string())
+                    .await?;
             }
         }
     }
@@ -300,6 +318,26 @@ async fn apply_drop_table(
 //     catalog.update_table(commit).await?;
 //     Ok(())
 // }
+
+/// Returns true for DDL tags that don't affect Iceberg schema and can be skipped.
+fn should_skip_ddl(ddl_tag: &str) -> bool {
+    matches!(
+        ddl_tag,
+        "CREATE TABLE"
+            | "CREATE TABLE AS"
+            | "CREATE INDEX"
+            | "DROP INDEX"
+            | "RENAME TABLE"
+            | "COMMENT"
+            | "CREATE SEQUENCE"
+            | "ALTER SEQUENCE"
+            | "DROP SEQUENCE"
+            | "CREATE TRIGGER"
+            | "DROP TRIGGER"
+            | "CREATE RULE"
+            | "DROP RULE"
+    )
+}
 
 /// Parse ALTER TABLE SQL to extract structured column changes using sqlparser.
 pub fn parse_alter_table(sql: &str) -> Vec<DdlColumnChange> {
