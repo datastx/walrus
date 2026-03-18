@@ -65,7 +65,14 @@ async fn test_multiple_ddl_events_ordered() {
         .await
         .unwrap();
     metadata
-        .insert_ddl_event(None, "DROP TABLE", "public", "t2", "DROP TABLE t2", Some("0/1100"))
+        .insert_ddl_event(
+            None,
+            "DROP TABLE",
+            "public",
+            "t2",
+            "DROP TABLE t2",
+            Some("0/1100"),
+        )
         .await
         .unwrap();
     metadata

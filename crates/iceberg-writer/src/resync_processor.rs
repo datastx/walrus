@@ -81,7 +81,12 @@ pub async fn process_resync(
     let (upsert_count, delete_count) =
         tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, u64)> {
             let engine = DuckDbEngine::new()?;
-            engine.load_resync_data_with_deletes(&old_data_paths, &old_delete_paths, &new_file_paths, &pk_cols)?;
+            engine.load_resync_data_with_deletes(
+                &old_data_paths,
+                &old_delete_paths,
+                &new_file_paths,
+                &pk_cols,
+            )?;
             engine.compute_resync_diff(&pk_cols)?;
             let uc = engine.export_upserts(&up)?;
             let dc = engine.export_deletes(&dp)?;
@@ -226,7 +231,6 @@ async fn get_existing_file_paths(table: &Table) -> anyhow::Result<(Vec<String>, 
 
     Ok((data_file_paths, delete_file_paths))
 }
-
 
 /// Append backfill files directly (used when there are no existing Iceberg data files).
 async fn append_backfill_files(

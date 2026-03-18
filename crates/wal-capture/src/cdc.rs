@@ -97,7 +97,15 @@ impl<'a> CdcState<'a> {
         slot_name: &'a str,
         staging_root: &'a Path,
         config: &'a WalCaptureConfig,
+        start_lsn: Lsn,
     ) -> Self {
+        // Derive next_seq from start_lsn so it is monotonic across restarts.
+        // An in-memory counter starting at 0 risks colliding with seq values
+        // assigned before a crash.  Since LSN is monotonic and persistent,
+        // using it as the initial seq guarantees that post-restart records
+        // always have higher seq values than pre-crash records at the same
+        // commit timestamp.
+        let initial_seq = start_lsn.0 as i64;
         Self {
             relation_cache: RelationCache::new(),
             table_buffers: HashMap::new(),
@@ -111,7 +119,7 @@ impl<'a> CdcState<'a> {
             slot_name,
             staging_root,
             config,
-            next_seq: 0,
+            next_seq: initial_seq,
             max_txn_records: 0,
         }
     }
@@ -269,6 +277,9 @@ impl<'a> CdcState<'a> {
         let Some(rel) = self.relation_cache.get(relation_oid) else {
             return Ok(());
         };
+        if rel.name == "walrus_ddl_audit" {
+            return Ok(());
+        }
         let rel = rel.clone();
 
         // When REPLICA IDENTITY FULL is set and the old tuple is provided,
@@ -288,15 +299,23 @@ impl<'a> CdcState<'a> {
         let Some(rel) = self.relation_cache.get(relation_oid) else {
             return Ok(());
         };
+        if rel.name == "walrus_ddl_audit" {
+            return Ok(());
+        }
         // With REPLICA IDENTITY NOTHING, DELETE messages have no old tuple values,
         // producing all-NULL columns. The resulting equality delete matches nothing.
-        if old_tuple.columns.iter().all(|c| matches!(c, TupleColumn::Null)) {
+        if old_tuple
+            .columns
+            .iter()
+            .all(|c| matches!(c, TupleColumn::Null))
+        {
             tracing::warn!(
                 table = %rel.name,
                 "DELETE with all-NULL columns — likely REPLICA IDENTITY NOTHING. \
                  Deletes will not be replicated. Set REPLICA IDENTITY DEFAULT or FULL."
             );
-            metrics::counter!("walrus_cdc_null_delete_total", "table" => rel.name.clone()).increment(1);
+            metrics::counter!("walrus_cdc_null_delete_total", "table" => rel.name.clone())
+                .increment(1);
         }
         let record = tuple_to_cdc_record(rel, CdcOp::Delete, old_tuple, Lsn::ZERO, 0);
         self.push_txn_record(record)
@@ -552,6 +571,7 @@ pub async fn run_cdc_loop(
         slot_name,
         params.staging_root,
         params.config,
+        start_lsn,
     );
 
     loop {
@@ -641,17 +661,41 @@ pub async fn run_cdc_loop(
                     }
                     PgOutputMessage::Truncate { relation_oids } => {
                         for oid in &relation_oids {
-                            let table_name = state.relation_cache.get(*oid)
-                                .map(|r| format!("{}.{}", r.schema, r.name))
-                                .unwrap_or_else(|| format!("oid:{}", oid));
-                            tracing::error!(
-                                table = %table_name,
-                                "TRUNCATE detected but not replicated to Iceberg — \
-                                 the Iceberg table will retain pre-truncate data. \
-                                 Run a manual resync to correct."
-                            );
+                            if let Some(rel) = state.relation_cache.get(*oid) {
+                                let schema = rel.schema.clone();
+                                let name = rel.name.clone();
+                                let key = format!("{}.{}", schema, name);
+                                tracing::warn!(
+                                    table = %key,
+                                    "TRUNCATE detected — requesting resync to reconcile Iceberg data"
+                                );
+                                // Discard any buffered CDC records for this table
+                                // (they predate the TRUNCATE and are meaningless)
+                                if let Some(buf) = state.table_buffers.get_mut(&key) {
+                                    state.total_buffered_rows -= buf.records.len();
+                                    state.total_buffered_bytes -= buf.total_bytes;
+                                    buf.clear();
+                                }
+                                // Request resync so the writer will diff the new
+                                // (post-truncate) snapshot against existing Iceberg data
+                                if let Err(e) =
+                                    state.metadata.request_table_resync(&schema, &name).await
+                                {
+                                    tracing::error!(
+                                        table = %key,
+                                        error = %e,
+                                        "Failed to request resync after TRUNCATE — \
+                                         manual intervention required"
+                                    );
+                                }
+                            } else {
+                                tracing::error!(
+                                    oid = oid,
+                                    "TRUNCATE detected for unknown relation OID"
+                                );
+                            }
                         }
-                        metrics::counter!("walrus_cdc_truncate_ignored_total").increment(1);
+                        metrics::counter!("walrus_cdc_truncate_resync_total").increment(1);
                     }
                     _ => {}
                 }
