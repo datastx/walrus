@@ -64,6 +64,7 @@ impl TableBuffer {
 struct TxnState {
     xid: u32,
     records: Vec<CdcRecord>,
+    ddl_events: Vec<BufferedDdlEvent>,
     spill_file: Option<SpillFile>,
     total_records: usize,
     total_bytes: usize,
@@ -119,6 +120,7 @@ impl<'a> CdcState<'a> {
         self.current_txn = Some(TxnState {
             xid,
             records: Vec::new(),
+            ddl_events: Vec::new(),
             spill_file: None,
             total_records: 0,
             total_bytes: 0,
@@ -127,6 +129,20 @@ impl<'a> CdcState<'a> {
 
     async fn handle_commit(&mut self, end_lsn: Lsn, commit_ts: i64) -> anyhow::Result<()> {
         if let Some(txn) = self.current_txn.take() {
+            // Flush buffered DDL events with commit LSN
+            for ddl in &txn.ddl_events {
+                self.metadata
+                    .insert_ddl_event(
+                        ddl.source_txn.as_deref(),
+                        &ddl.ddl_tag,
+                        &ddl.target_schema,
+                        &ddl.target_table,
+                        &ddl.ddl_sql,
+                        Some(&end_lsn.to_string()),
+                    )
+                    .await?;
+            }
+
             let total_records = txn.total_records;
             tracing::trace!(xid = txn.xid, records = total_records, "Commit");
 
@@ -194,7 +210,19 @@ impl<'a> CdcState<'a> {
             return Ok(());
         };
         if rel.name == "walrus_ddl_audit" {
-            handle_ddl_insert(tuple, rel, self.metadata).await?;
+            if let Some(txn) = &mut self.current_txn {
+                let ddl = parse_ddl_from_tuple(tuple);
+                if let Some(ddl) = ddl {
+                    txn.ddl_events.push(ddl);
+                }
+            } else if let Some(xid) = self.current_streaming_xid {
+                if let Some(stxn) = self.streaming_txns.get_mut(&xid) {
+                    let ddl = parse_ddl_from_tuple(tuple);
+                    if let Some(ddl) = ddl {
+                        stxn.ddl_events.push(ddl);
+                    }
+                }
+            }
             return Ok(());
         }
         let record = tuple_to_cdc_record(rel, CdcOp::Insert, tuple, Lsn::ZERO, 0);
@@ -265,6 +293,7 @@ impl<'a> CdcState<'a> {
                 TxnState {
                     xid,
                     records: Vec::new(),
+                    ddl_events: Vec::new(),
                     spill_file: None,
                     total_records: 0,
                     total_bytes: 0,
@@ -295,6 +324,20 @@ impl<'a> CdcState<'a> {
         }
 
         if let Some(txn) = self.streaming_txns.remove(&xid) {
+            // Flush buffered DDL events with stream commit LSN
+            for ddl in &txn.ddl_events {
+                self.metadata
+                    .insert_ddl_event(
+                        ddl.source_txn.as_deref(),
+                        &ddl.ddl_tag,
+                        &ddl.target_schema,
+                        &ddl.target_table,
+                        &ddl.ddl_sql,
+                        Some(&end_lsn.to_string()),
+                    )
+                    .await?;
+            }
+
             let total_records = txn.total_records;
             tracing::debug!(xid, records = total_records, "Stream commit");
 
@@ -673,11 +716,8 @@ fn tuple_to_cdc_record(
     }
 }
 
-async fn handle_ddl_insert(
-    tuple: &TupleData,
-    _rel: &CachedRelation,
-    metadata: &MetadataStore,
-) -> anyhow::Result<()> {
+/// Parse DDL event fields from a walrus_ddl_audit tuple (sync, no metadata call).
+fn parse_ddl_from_tuple(tuple: &TupleData) -> Option<BufferedDdlEvent> {
     let get_text = |idx: usize| -> Option<String> {
         tuple.columns.get(idx).and_then(|c| match c {
             TupleColumn::Text(data) => String::from_utf8(data.clone()).ok(),
@@ -691,13 +731,18 @@ async fn handle_ddl_insert(
     let schema = get_text(7).unwrap_or_else(|| "public".to_string());
     let ddl_sql = get_text(8).unwrap_or_default();
 
-    if !tag.is_empty() {
-        tracing::info!(tag = %tag, schema = %schema, table = %table_name, "Captured DDL event from WAL");
-        metadata
-            .insert_ddl_event(txn.as_deref(), &tag, &schema, &table_name, &ddl_sql)
-            .await?;
+    if tag.is_empty() {
+        return None;
     }
-    Ok(())
+
+    tracing::info!(tag = %tag, schema = %schema, table = %table_name, "Buffered DDL event from WAL");
+    Some(BufferedDdlEvent {
+        source_txn: txn,
+        ddl_tag: tag,
+        target_schema: schema,
+        target_table: table_name,
+        ddl_sql,
+    })
 }
 
 async fn flush_all_buffers(

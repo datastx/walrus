@@ -507,6 +507,13 @@ impl MetadataStore {
                             AND bf.table_name = fq.table_name \
                             AND bf.file_type = 'backfill' \
                             AND bf.status NOT IN ('completed', 'deleted', 'failed') \
+                        ) \
+                        AND NOT EXISTS ( \
+                          SELECT 1 FROM _pgiceberg.ddl_events de \
+                          WHERE de.target_schema = fq.table_schema \
+                            AND de.target_table = fq.table_name \
+                            AND de.status IN ('pending', 'applying', 'failed') \
+                            AND (de.ddl_lsn IS NULL OR de.ddl_lsn < fq.lsn_low) \
                         )) \
                      ) \
                    ORDER BY fq.created_at \
@@ -736,19 +743,21 @@ impl MetadataStore {
         target_schema: &str,
         target_table: &str,
         ddl_sql: &str,
+        ddl_lsn: Option<&str>,
     ) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         client
             .execute(
                 "INSERT INTO _pgiceberg.ddl_events \
-                 (source_txn, ddl_tag, target_schema, target_table, ddl_sql) \
-                 VALUES ($1, $2, $3, $4, $5)",
+                 (source_txn, ddl_tag, target_schema, target_table, ddl_sql, ddl_lsn) \
+                 VALUES ($1, $2, $3, $4, $5, $6::pg_lsn)",
                 &[
                     &source_txn,
                     &ddl_tag,
                     &target_schema,
                     &target_table,
                     &ddl_sql,
+                    &ddl_lsn,
                 ],
             )
             .await?;
@@ -760,9 +769,9 @@ impl MetadataStore {
         let rows = client
             .query(
                 "SELECT event_id, source_txn, ddl_tag, target_schema, target_table, ddl_sql, \
-                 applied_to_iceberg \
+                 ddl_lsn::text, status \
                  FROM _pgiceberg.ddl_events \
-                 WHERE applied_to_iceberg = FALSE \
+                 WHERE status = 'pending' \
                  ORDER BY event_id",
                 &[],
             )
@@ -776,22 +785,110 @@ impl MetadataStore {
                 target_schema: r.get(3),
                 target_table: r.get(4),
                 ddl_sql: r.get(5),
-                applied_to_iceberg: r.get(6),
+                ddl_lsn: r.get(6),
+                status: r.get::<_, String>(7).parse().unwrap(),
             })
             .collect())
     }
 
     pub async fn mark_ddl_applied(&self, event_id: i64) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
+        // Update the event status and clear any DDL block on the table
+        let row = client
+            .query_opt(
+                "UPDATE _pgiceberg.ddl_events \
+                 SET status = 'applied', applied_to_iceberg = TRUE, applied_at = now() \
+                 WHERE event_id = $1 \
+                 RETURNING target_schema, target_table",
+                &[&event_id],
+            )
+            .await?;
+        if let Some(r) = row {
+            let schema: String = r.get(0);
+            let table: String = r.get(1);
+            client
+                .execute(
+                    "UPDATE _pgiceberg.table_state \
+                     SET ddl_blocked_since = NULL, updated_at = now() \
+                     WHERE table_schema = $1 AND table_name = $2 \
+                       AND ddl_blocked_since IS NOT NULL",
+                    &[&schema, &table],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Atomically claim a DDL event for processing (crash guard).
+    /// Returns true if the event was claimed, false if already claimed.
+    pub async fn claim_ddl_event(&self, event_id: i64) -> anyhow::Result<bool> {
+        let client = self.pool.get().await?;
+        let result = client
+            .execute(
+                "UPDATE _pgiceberg.ddl_events \
+                 SET status = 'applying' \
+                 WHERE event_id = $1 AND status = 'pending'",
+                &[&event_id],
+            )
+            .await?;
+        Ok(result > 0)
+    }
+
+    /// Mark a DDL event as failed and block the table's CDC pipeline.
+    pub async fn mark_ddl_failed(&self, event_id: i64, error_msg: &str) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        let row = client
+            .query_opt(
+                "UPDATE _pgiceberg.ddl_events \
+                 SET status = 'failed', error_message = $2 \
+                 WHERE event_id = $1 \
+                 RETURNING target_schema, target_table",
+                &[&event_id, &error_msg],
+            )
+            .await?;
+        if let Some(r) = row {
+            let schema: String = r.get(0);
+            let table: String = r.get(1);
+            client
+                .execute(
+                    "UPDATE _pgiceberg.table_state \
+                     SET ddl_blocked_since = now(), updated_at = now() \
+                     WHERE table_schema = $1 AND table_name = $2",
+                    &[&schema, &table],
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Mark a DDL event as skipped (irrelevant to Iceberg schema).
+    pub async fn mark_ddl_skipped(&self, event_id: i64) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
         client
             .execute(
                 "UPDATE _pgiceberg.ddl_events \
-                 SET applied_to_iceberg = TRUE, applied_at = now() \
+                 SET status = 'skipped', applied_to_iceberg = TRUE, applied_at = now() \
                  WHERE event_id = $1",
                 &[&event_id],
             )
             .await?;
         Ok(())
+    }
+
+    /// Reclaim DDL events stuck in 'applying' for > 10 minutes (crash recovery).
+    pub async fn reclaim_stale_ddl_events(&self) -> anyhow::Result<u64> {
+        let client = self.pool.get().await?;
+        let count = client
+            .execute(
+                "UPDATE _pgiceberg.ddl_events \
+                 SET status = 'pending' \
+                 WHERE status = 'applying' \
+                   AND applied_at IS NULL \
+                   AND captured_at < now() - interval '10 minutes'",
+                &[],
+            )
+            .await?;
+        Ok(count)
     }
 
     // ── Primary key discovery (for stateless recovery) ────────────
@@ -929,6 +1026,8 @@ CREATE TABLE IF NOT EXISTS _pgiceberg.ddl_events (
     target_schema       TEXT NOT NULL,
     target_table        TEXT NOT NULL DEFAULT '',
     ddl_sql             TEXT NOT NULL,
+    ddl_lsn             PG_LSN,
+    status              TEXT NOT NULL DEFAULT 'pending',
     captured_at         TIMESTAMPTZ DEFAULT now(),
     applied_to_iceberg  BOOLEAN DEFAULT FALSE,
     applied_at          TIMESTAMPTZ,
@@ -941,4 +1040,12 @@ ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS writer_backfill_file
 ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS writer_last_committed_lsn PG_LSN;
 ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS streaming_since TIMESTAMPTZ;
 ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS needs_resync BOOLEAN DEFAULT FALSE;
+
+-- DDL lifecycle migrations
+ALTER TABLE _pgiceberg.ddl_events ADD COLUMN IF NOT EXISTS ddl_lsn PG_LSN;
+ALTER TABLE _pgiceberg.ddl_events ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+-- Backfill status from legacy boolean column
+UPDATE _pgiceberg.ddl_events SET status = 'applied' WHERE applied_to_iceberg = TRUE AND status = 'pending';
+-- Add ddl_blocked_since to table_state
+ALTER TABLE _pgiceberg.table_state ADD COLUMN IF NOT EXISTS ddl_blocked_since TIMESTAMPTZ;
 "#;

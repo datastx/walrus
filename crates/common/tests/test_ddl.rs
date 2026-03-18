@@ -20,6 +20,7 @@ async fn test_ddl_event_lifecycle() {
             "public",
             "users",
             "ALTER TABLE users ADD COLUMN age INT",
+            Some("0/1A00"),
         )
         .await
         .unwrap();
@@ -29,7 +30,10 @@ async fn test_ddl_event_lifecycle() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].ddl_tag, "ALTER TABLE");
     assert_eq!(events[0].target_table, "users");
-    assert!(!events[0].applied_to_iceberg);
+    assert_eq!(
+        events[0].status,
+        pgiceberg_common::models::DdlEventStatus::Pending
+    );
 
     // Mark as applied
     metadata.mark_ddl_applied(events[0].event_id).await.unwrap();
@@ -56,11 +60,12 @@ async fn test_multiple_ddl_events_ordered() {
             "public",
             "t1",
             "ALTER TABLE t1 ADD COLUMN a INT",
+            Some("0/1000"),
         )
         .await
         .unwrap();
     metadata
-        .insert_ddl_event(None, "DROP TABLE", "public", "t2", "DROP TABLE t2")
+        .insert_ddl_event(None, "DROP TABLE", "public", "t2", "DROP TABLE t2", Some("0/1100"))
         .await
         .unwrap();
     metadata
@@ -70,6 +75,7 @@ async fn test_multiple_ddl_events_ordered() {
             "public",
             "t1",
             "ALTER TABLE t1 DROP COLUMN b",
+            Some("0/1200"),
         )
         .await
         .unwrap();

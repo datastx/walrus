@@ -53,6 +53,15 @@ pub async fn run_processing_loop(
                 }
                 _ => {}
             }
+            match metadata.reclaim_stale_ddl_events().await {
+                Ok(count) if count > 0 => {
+                    info!(reclaimed = count, "Reclaimed stale DDL events");
+                }
+                Err(e) => {
+                    warn!("DDL stale reclaim error: {}", e);
+                }
+                _ => {}
+            }
             last_reclaim = Instant::now();
         }
 

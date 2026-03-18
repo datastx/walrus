@@ -203,6 +203,58 @@ pub struct FileQueueEntry {
     pub error_message: Option<String>,
 }
 
+/// Status lifecycle for DDL events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DdlEventStatus {
+    Pending,
+    Applying,
+    Applied,
+    Failed,
+    Skipped,
+}
+
+impl DdlEventStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DdlEventStatus::Pending => "pending",
+            DdlEventStatus::Applying => "applying",
+            DdlEventStatus::Applied => "applied",
+            DdlEventStatus::Failed => "failed",
+            DdlEventStatus::Skipped => "skipped",
+        }
+    }
+}
+
+impl std::fmt::Display for DdlEventStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for DdlEventStatus {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "applying" => DdlEventStatus::Applying,
+            "applied" => DdlEventStatus::Applied,
+            "failed" => DdlEventStatus::Failed,
+            "skipped" => DdlEventStatus::Skipped,
+            _ => DdlEventStatus::Pending,
+        })
+    }
+}
+
+/// A DDL event parsed from the WAL for buffering before commit.
+#[derive(Debug, Clone)]
+pub struct BufferedDdlEvent {
+    pub source_txn: Option<String>,
+    pub ddl_tag: String,
+    pub target_schema: String,
+    pub target_table: String,
+    pub ddl_sql: String,
+}
+
 /// Row from `_pgiceberg.ddl_events`
 #[derive(Debug, Clone)]
 pub struct DdlEvent {
@@ -212,7 +264,8 @@ pub struct DdlEvent {
     pub target_schema: String,
     pub target_table: String,
     pub ddl_sql: String,
-    pub applied_to_iceberg: bool,
+    pub ddl_lsn: Option<String>,
+    pub status: DdlEventStatus,
 }
 
 /// A single CDC record decoded from WAL.
