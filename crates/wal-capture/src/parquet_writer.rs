@@ -129,7 +129,12 @@ fn build_array_from_cdc_columns(
                 .iter()
                 .map(|v| {
                     v.and_then(|b| std::str::from_utf8(b).ok())
-                        .and_then(|s| s.parse().ok())
+                        .and_then(|s| match s {
+                            "NaN" => Some(f32::NAN),
+                            "Infinity" => Some(f32::INFINITY),
+                            "-Infinity" => Some(f32::NEG_INFINITY),
+                            _ => s.parse().ok(),
+                        })
                 })
                 .collect();
             Ok(Arc::new(Float32Array::from(parsed)))
@@ -139,7 +144,12 @@ fn build_array_from_cdc_columns(
                 .iter()
                 .map(|v| {
                     v.and_then(|b| std::str::from_utf8(b).ok())
-                        .and_then(|s| s.parse().ok())
+                        .and_then(|s| match s {
+                            "NaN" => Some(f64::NAN),
+                            "Infinity" => Some(f64::INFINITY),
+                            "-Infinity" => Some(f64::NEG_INFINITY),
+                            _ => s.parse().ok(),
+                        })
                 })
                 .collect();
             Ok(Arc::new(Float64Array::from(parsed)))
@@ -147,17 +157,20 @@ fn build_array_from_cdc_columns(
         DataType::Date32 => {
             // pgoutput sends dates as text like "2024-01-15".
             // Parse to NaiveDate, then convert to days since Unix epoch.
+            // Handle PostgreSQL's "infinity"/"-infinity" special values.
             let parsed: Vec<Option<i32>> = values
                 .iter()
                 .map(|v| {
                     v.and_then(|b| std::str::from_utf8(b).ok())
-                        .and_then(|s| {
-                            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .and_then(|s| match s {
+                            "infinity" => Some(i32::MAX),
+                            "-infinity" => Some(i32::MIN),
+                            _ => chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                                 .ok()
                                 .map(|d| {
                                     (d - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
                                         .num_days() as i32
-                                })
+                                }),
                         })
                 })
                 .collect();
@@ -166,17 +179,21 @@ fn build_array_from_cdc_columns(
         DataType::Timestamp(TimeUnit::Microsecond, tz) => {
             // pgoutput sends timestamps as text like "2024-01-15 10:30:00.123456".
             // Parse and convert to microseconds since Unix epoch.
+            // Handle PostgreSQL's "infinity"/"-infinity" special values.
             let parsed: Vec<Option<i64>> = values
                 .iter()
                 .map(|v| {
                     v.and_then(|b| std::str::from_utf8(b).ok())
-                        .and_then(|s| {
-                            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                        .and_then(|s| match s {
+                            "infinity" => Some(i64::MAX),
+                            "-infinity" => Some(i64::MIN),
+                            _ => chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
                                 .ok()
                                 .or_else(|| {
-                                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
+                                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                                        .ok()
                                 })
-                                .map(|dt| dt.and_utc().timestamp_micros())
+                                .map(|dt| dt.and_utc().timestamp_micros()),
                         })
                 })
                 .collect();

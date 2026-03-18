@@ -180,8 +180,9 @@ impl DuckDbEngine {
                 "Applying equality deletes to old data for resync diff"
             );
             self.conn.execute_batch(&sql)?;
-            self.conn
-                .execute_batch("DROP TABLE IF EXISTS _raw_old_data; DROP TABLE IF EXISTS _delete_keys;")?;
+            self.conn.execute_batch(
+                "DROP TABLE IF EXISTS _raw_old_data; DROP TABLE IF EXISTS _delete_keys;",
+            )?;
         }
 
         let sql = format!(
@@ -194,24 +195,61 @@ impl DuckDbEngine {
         Ok(())
     }
 
-    /// Compute the diff between new_data and old_data using EXCEPT.
+    /// Compute the diff between new_data and old_data.
+    ///
+    /// Uses EXCEPT when schemas match (fast path). Falls back to PK-based
+    /// anti-join when schemas differ (e.g., column added/dropped since last
+    /// sync), avoiding the DuckDB error that EXCEPT requires matching columns.
     ///
     /// Creates:
-    ///   - `to_upsert`: rows in new_data that are new or changed (full row EXCEPT)
+    ///   - `to_upsert`: rows in new_data that are new or changed
     ///   - `delete_keys`: PK values in old_data that no longer exist in new_data
     pub fn compute_resync_diff(&self, pk_columns: &[String]) -> anyhow::Result<()> {
-        // Upserts: rows that are in the new snapshot but not (or changed) in the old
-        self.conn.execute_batch(
-            "CREATE OR REPLACE TABLE to_upsert AS \
-             SELECT * FROM new_data EXCEPT SELECT * FROM old_data",
-        )?;
-
-        // Deletes: PKs that exist in old data but not in new data
         let pk_csv = pk_columns
             .iter()
             .map(|c| format!("\"{}\"", c))
             .collect::<Vec<_>>()
             .join(", ");
+
+        // Try EXCEPT first (fast path for matching schemas)
+        let except_ok = self
+            .conn
+            .execute_batch(
+                "CREATE OR REPLACE TABLE to_upsert AS \
+                 SELECT * FROM new_data EXCEPT SELECT * FROM old_data",
+            )
+            .is_ok();
+
+        if !except_ok {
+            // Schema mismatch: fall back to PK-based diff.
+            // Since the schema changed, all rows from new_data are upserted
+            // (the entire table needs rewriting with the new schema).
+            debug!("Resync using PK-based diff — old and new schemas differ");
+            let pk_join = pk_columns
+                .iter()
+                .map(|c| format!("n.\"{}\" = o.\"{}\"", c, c))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+
+            self.conn.execute_batch(&format!(
+                "CREATE OR REPLACE TABLE to_upsert AS \
+                 SELECT n.* FROM new_data n \
+                 LEFT JOIN old_data o ON {pk_join} \
+                 WHERE o.\"{first_pk}\" IS NULL",
+                pk_join = pk_join,
+                first_pk = pk_columns[0]
+            ))?;
+            // Also include rows where PK exists in both — schema changed so
+            // values need rewriting even if they look the same.
+            self.conn.execute_batch(&format!(
+                "INSERT INTO to_upsert \
+                 SELECT n.* FROM new_data n \
+                 INNER JOIN old_data o ON {pk_join}",
+                pk_join = pk_join
+            ))?;
+        }
+
+        // Deletes: PKs in old but not in new (PK-only EXCEPT always works)
         let sql = format!(
             "CREATE OR REPLACE TABLE delete_keys AS \
              SELECT {pk} FROM old_data EXCEPT SELECT {pk} FROM new_data",

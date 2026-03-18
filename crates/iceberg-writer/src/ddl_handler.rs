@@ -183,9 +183,7 @@ async fn process_single_event(
             );
             Ok(())
         }
-        "COMMENT" => {
-            apply_comment(event, catalog).await
-        }
+        "COMMENT" => apply_comment(event, catalog).await,
         other => {
             warn!(tag = other, "Unhandled DDL type");
             Ok(())
@@ -342,7 +340,10 @@ async fn apply_comment(event: &DdlEvent, catalog: &SqlCatalog) -> anyhow::Result
                 }
             }
         }
-        CommentTarget::Column { column_name, comment } => {
+        CommentTarget::Column {
+            column_name,
+            comment,
+        } => {
             info!(
                 schema = %event.target_schema,
                 table = %event.target_table,
@@ -406,8 +407,13 @@ fn should_skip_ddl(ddl_tag: &str) -> bool {
 /// Parsed target of a COMMENT ON statement.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommentTarget {
-    Table { comment: Option<String> },
-    Column { column_name: String, comment: Option<String> },
+    Table {
+        comment: Option<String>,
+    },
+    Column {
+        column_name: String,
+        comment: Option<String>,
+    },
     Other,
 }
 
@@ -420,7 +426,13 @@ pub fn parse_comment_sql(sql: &str) -> CommentTarget {
     };
 
     for stmt in stmts {
-        if let Statement::Comment { object_type, object_name, comment, .. } = stmt {
+        if let Statement::Comment {
+            object_type,
+            object_name,
+            comment,
+            ..
+        } = stmt
+        {
             match object_type {
                 CommentObject::Table => {
                     return CommentTarget::Table { comment };
@@ -433,7 +445,10 @@ pub fn parse_comment_sql(sql: &str) -> CommentTarget {
                         .and_then(|part| part.as_ident())
                         .map(|ident| ident.value.clone())
                         .unwrap_or_default();
-                    return CommentTarget::Column { column_name, comment };
+                    return CommentTarget::Column {
+                        column_name,
+                        comment,
+                    };
                 }
                 _ => return CommentTarget::Other,
             }

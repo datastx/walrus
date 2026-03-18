@@ -431,7 +431,10 @@ async fn register_new_tables(
                     &pk_cols,
                 )
                 .await?;
-            info!(schema, table, "Registered new table from config (requires re-bootstrap for backfill)");
+            info!(
+                schema,
+                table, "Registered new table from config (requires re-bootstrap for backfill)"
+            );
         }
     }
     Ok(())

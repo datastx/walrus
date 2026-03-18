@@ -403,7 +403,119 @@ fn test_empty_input() {
     assert!(!upsert_path.exists()); // no file written for 0 rows
 }
 
-// ── Test 11: Cleanup drops tables ───────────────────────────────────────────
+// ── Test 11: Resync diff with matching schemas ──────────────────────────────
+
+#[test]
+fn test_resync_diff_matching_schemas() {
+    let dir = TempDir::new().unwrap();
+
+    // Helper: write backfill-style Parquet (no CDC metadata columns)
+    let write_backfill = |name: &str, rows: &[(i32, &str)]| -> String {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, true),
+        ]));
+        let path = dir.path().join(name);
+        let pks: Vec<i32> = rows.iter().map(|r| r.0).collect();
+        let vals: Vec<&str> = rows.iter().map(|r| r.1).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(pks)),
+                Arc::new(StringArray::from(vals)),
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path.to_string_lossy().into_owned()
+    };
+
+    let old_path = write_backfill("old.parquet", &[(1, "a"), (2, "b"), (3, "c")]);
+    let new_path = write_backfill("new.parquet", &[(1, "a"), (2, "changed"), (4, "new")]);
+
+    let engine = DuckDbEngine::new().unwrap();
+    engine
+        .load_resync_data_with_deletes(&[old_path], &[], &[new_path], &pk_cols())
+        .unwrap();
+    engine.compute_resync_diff(&pk_cols()).unwrap();
+
+    // pk=2 changed, pk=4 is new → 2 upserts
+    assert_eq!(engine.table_count("to_upsert").unwrap(), 2);
+    // pk=3 was deleted
+    let deletes = query_delete_keys(&engine, "pk");
+    assert_eq!(deletes, vec![3]);
+}
+
+// ── Test 12: Resync diff with schema mismatch (PK-based fallback) ───────────
+
+#[test]
+fn test_resync_diff_schema_mismatch() {
+    let dir = TempDir::new().unwrap();
+
+    // Old data: (pk, value)
+    let old_schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Int32, false),
+        Field::new("value", DataType::Utf8, true),
+    ]));
+    let old_path = dir.path().join("old.parquet");
+    let batch = RecordBatch::try_new(
+        old_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+    let file = std::fs::File::create(&old_path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, old_schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    // New data: (pk, value, extra_col) — column added
+    let new_schema = Arc::new(Schema::new(vec![
+        Field::new("pk", DataType::Int32, false),
+        Field::new("value", DataType::Utf8, true),
+        Field::new("extra_col", DataType::Utf8, true),
+    ]));
+    let new_path = dir.path().join("new.parquet");
+    let batch = RecordBatch::try_new(
+        new_schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 4])),
+            Arc::new(StringArray::from(vec!["a", "changed", "new"])),
+            Arc::new(StringArray::from(vec!["x", "y", "z"])),
+        ],
+    )
+    .unwrap();
+    let file = std::fs::File::create(&new_path).unwrap();
+    let mut writer = ArrowWriter::try_new(file, new_schema, None).unwrap();
+    writer.write(&batch).unwrap();
+    writer.close().unwrap();
+
+    let engine = DuckDbEngine::new().unwrap();
+    engine
+        .load_resync_data_with_deletes(
+            &[old_path.to_string_lossy().into_owned()],
+            &[],
+            &[new_path.to_string_lossy().into_owned()],
+            &pk_cols(),
+        )
+        .unwrap();
+
+    // This should NOT error — falls back to PK-based diff
+    engine.compute_resync_diff(&pk_cols()).unwrap();
+
+    // All 3 rows from new_data are upserts (schema changed)
+    assert_eq!(engine.table_count("to_upsert").unwrap(), 3);
+    // pk=3 was deleted
+    let deletes = query_delete_keys(&engine, "pk");
+    assert_eq!(deletes, vec![3]);
+}
+
+// ── Test 13: Cleanup drops tables ───────────────────────────────────────────
 
 #[test]
 fn test_cleanup_drops_tables() {

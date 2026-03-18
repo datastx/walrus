@@ -377,6 +377,29 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Request a resync for a specific table (e.g., after TRUNCATE).
+    ///
+    /// Sets `needs_resync = TRUE` and resets the table phase to `pending` so
+    /// the backfill pipeline will re-export the table on next restart. The
+    /// Iceberg Writer will then diff the new (empty or changed) snapshot
+    /// against existing Iceberg data.
+    pub async fn request_table_resync(&self, schema: &str, table: &str) -> anyhow::Result<()> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "UPDATE _pgiceberg.table_state \
+                 SET needs_resync = TRUE, \
+                     phase = 'pending', \
+                     backfill_done_partitions = 0, \
+                     writer_backfill_files_done = 0, \
+                     updated_at = now() \
+                 WHERE table_schema = $1 AND table_name = $2",
+                &[&schema, &table],
+            )
+            .await?;
+        Ok(())
+    }
+
     // ── writer progress ────────────────────────────────────────────
 
     /// Increment the count of backfill files the writer has committed to Iceberg.
