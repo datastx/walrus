@@ -57,6 +57,18 @@ pub async fn ensure_iceberg_table(
     }
 
     let columns = metadata.discover_columns(schema_name, table_name).await?;
+    let (table_comment, column_comments) = metadata
+        .discover_comments(schema_name, table_name)
+        .await
+        .unwrap_or_else(|e| {
+            info!(error = %e, "Failed to discover comments — proceeding without");
+            (None, vec![])
+        });
+
+    let comment_map: std::collections::HashMap<&str, &str> = column_comments
+        .iter()
+        .map(|(name, comment)| (name.as_str(), comment.as_str()))
+        .collect();
 
     let mut fields = Vec::new();
     let mut pk_field_ids = Vec::new();
@@ -66,17 +78,23 @@ pub async fn ensure_iceberg_table(
         let iceberg_type = pg_udt_to_iceberg_type(udt_name);
         let required = !nullable || pk_columns.contains(col_name);
 
-        let field = if required {
-            Arc::new(NestedField::required(field_id, col_name, iceberg_type))
+        let nested = if required {
+            NestedField::required(field_id, col_name, iceberg_type)
         } else {
-            Arc::new(NestedField::optional(field_id, col_name, iceberg_type))
+            NestedField::optional(field_id, col_name, iceberg_type)
+        };
+
+        let nested = if let Some(&doc) = comment_map.get(col_name.as_str()) {
+            nested.with_doc(doc)
+        } else {
+            nested
         };
 
         if pk_columns.contains(col_name) {
             pk_field_ids.push(field_id);
         }
 
-        fields.push(field);
+        fields.push(Arc::new(nested));
         field_id += 1;
     }
 
@@ -85,9 +103,15 @@ pub async fn ensure_iceberg_table(
         .with_identifier_field_ids(pk_field_ids)
         .build()?;
 
+    let mut props: Vec<(String, String)> = Vec::new();
+    if let Some(ref comment) = table_comment {
+        props.push(("comment".to_string(), comment.clone()));
+    }
+
     let creation = TableCreation::builder()
         .name(table_name.to_string())
         .schema(iceberg_schema)
+        .properties(props)
         .build();
 
     let table = catalog.create_table(&namespace, creation).await?;

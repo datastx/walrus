@@ -917,6 +917,42 @@ impl MetadataStore {
         Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
+    /// Discover table and column comments from pg_description.
+    /// Returns `(table_comment, vec_of_(column_name, comment))`.
+    pub async fn discover_comments(
+        &self,
+        schema: &str,
+        table: &str,
+    ) -> anyhow::Result<(Option<String>, Vec<(String, String)>)> {
+        let client = self.pool.get().await?;
+
+        // Table comment
+        let table_comment: Option<String> = client
+            .query_one(
+                "SELECT obj_description(($1 || '.' || $2)::regclass, 'pg_class')",
+                &[&schema, &table],
+            )
+            .await?
+            .get(0);
+
+        // Column comments
+        let rows = client
+            .query(
+                "SELECT a.attname, col_description(a.attrelid, a.attnum) \
+                 FROM pg_attribute a \
+                 WHERE a.attrelid = ($1 || '.' || $2)::regclass \
+                   AND a.attnum > 0 AND NOT a.attisdropped \
+                   AND col_description(a.attrelid, a.attnum) IS NOT NULL \
+                 ORDER BY a.attnum",
+                &[&schema, &table],
+            )
+            .await?;
+        let column_comments: Vec<(String, String)> =
+            rows.iter().map(|r| (r.get(0), r.get(1))).collect();
+
+        Ok((table_comment, column_comments))
+    }
+
     /// Discover column metadata from information_schema.  Used on startup to
     /// rebuild Arrow schemas without persisting them.
     pub async fn discover_columns(

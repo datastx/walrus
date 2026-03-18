@@ -90,3 +90,38 @@ fn test_ddl_column_change_display() {
     };
     assert_eq!(drop.to_string(), "DROP COLUMN email");
 }
+
+#[test]
+fn test_parse_comment_on_table() {
+    let target = parse_comment_sql("COMMENT ON TABLE public.users IS 'User accounts'");
+    assert_eq!(
+        target,
+        CommentTarget::Table {
+            comment: Some("User accounts".to_string())
+        }
+    );
+}
+
+#[test]
+fn test_parse_comment_on_column() {
+    let target = parse_comment_sql("COMMENT ON COLUMN public.users.email IS 'Primary email'");
+    assert_eq!(
+        target,
+        CommentTarget::Column {
+            column_name: "email".to_string(),
+            comment: Some("Primary email".to_string()),
+        }
+    );
+}
+
+#[test]
+fn test_parse_comment_on_table_null() {
+    let target = parse_comment_sql("COMMENT ON TABLE public.users IS NULL");
+    assert_eq!(target, CommentTarget::Table { comment: None });
+}
+
+#[test]
+fn test_parse_comment_malformed() {
+    let target = parse_comment_sql("NOT VALID SQL AT ALL %%%");
+    assert_eq!(target, CommentTarget::Other);
+}
