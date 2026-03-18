@@ -283,7 +283,8 @@ async fn bootstrap_ddl_audit(client: &Client, config: &SourceConfig) -> anyhow::
              DECLARE _r record;
              BEGIN
                  IF (tg_tag = 'CREATE TABLE' OR tg_tag = 'ALTER TABLE' OR
-                     tg_tag = 'DROP TABLE'   OR tg_tag = 'CREATE TABLE AS') THEN
+                     tg_tag = 'DROP TABLE'   OR tg_tag = 'CREATE TABLE AS' OR
+                     tg_tag = 'COMMENT') THEN
                      SELECT current_query() INTO _qry;
                      _tbl_name := '';
                      _tbl_schema := current_schema;

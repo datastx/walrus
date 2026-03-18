@@ -1,9 +1,10 @@
 use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_catalog_sql::SqlCatalog;
 use pgiceberg_common::metadata::MetadataStore;
 use pgiceberg_common::models::DdlEvent;
-use sqlparser::ast::Statement;
+use sqlparser::ast::{CommentObject, Statement};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::sync::Arc;
@@ -89,7 +90,7 @@ pub async fn process_ddl_events(
             continue;
         }
 
-        match process_single_event(event, catalog).await {
+        match process_single_event(event, catalog, metadata).await {
             Ok(()) => {
                 metadata.mark_ddl_applied(event.event_id).await?;
                 info!(
@@ -115,7 +116,11 @@ pub async fn process_ddl_events(
     Ok(())
 }
 
-async fn process_single_event(event: &DdlEvent, catalog: &SqlCatalog) -> anyhow::Result<()> {
+async fn process_single_event(
+    event: &DdlEvent,
+    catalog: &SqlCatalog,
+    _metadata: &MetadataStore,
+) -> anyhow::Result<()> {
     match event.ddl_tag.as_str() {
         "ALTER TABLE" => {
             let changes = parse_alter_table(&event.ddl_sql);
@@ -177,6 +182,9 @@ async fn process_single_event(event: &DdlEvent, catalog: &SqlCatalog) -> anyhow:
                 "CREATE TABLE detected — will be handled when data arrives"
             );
             Ok(())
+        }
+        "COMMENT" => {
+            apply_comment(event, catalog).await
         }
         other => {
             warn!(tag = other, "Unhandled DDL type");
@@ -298,6 +306,63 @@ async fn apply_drop_table(
     Ok(())
 }
 
+/// Apply a COMMENT ON statement to an Iceberg table.
+async fn apply_comment(event: &DdlEvent, catalog: &SqlCatalog) -> anyhow::Result<()> {
+    let target = parse_comment_sql(&event.ddl_sql);
+
+    match target {
+        CommentTarget::Table { comment } => {
+            let namespace = NamespaceIdent::new(event.target_schema.clone());
+            let table_ident = TableIdent::new(namespace, event.target_table.clone());
+
+            match catalog.load_table(&table_ident).await {
+                Ok(table) => {
+                    let action = Transaction::new(&table).update_table_properties();
+                    let action = if let Some(ref text) = comment {
+                        action.set("comment".to_string(), text.clone())
+                    } else {
+                        action.remove("comment".to_string())
+                    };
+                    let tx = action.apply(Transaction::new(&table))?;
+                    tx.commit(catalog).await?;
+                    info!(
+                        schema = %event.target_schema,
+                        table = %event.target_table,
+                        comment = ?comment,
+                        "Applied table comment to Iceberg"
+                    );
+                }
+                Err(e) => {
+                    info!(
+                        schema = %event.target_schema,
+                        table = %event.target_table,
+                        error = %e,
+                        "Table not found in Iceberg — skipping comment update"
+                    );
+                }
+            }
+        }
+        CommentTarget::Column { column_name, comment } => {
+            info!(
+                schema = %event.target_schema,
+                table = %event.target_table,
+                column = %column_name,
+                comment = ?comment,
+                "Column comment captured — cannot commit schema change yet (iceberg-rust 0.8.0 \
+                 does not expose TableCommit builder). Column doc will sync on next table recreation."
+            );
+        }
+        CommentTarget::Other => {
+            info!(
+                sql = %event.ddl_sql,
+                "COMMENT on unsupported object type — skipping"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 // NOTE: This function is ready for when iceberg-rust 0.8.x+ exposes schema evolution.
 // Currently blocked because TableCommit::builder().build() is pub(crate).
 //
@@ -328,7 +393,6 @@ fn should_skip_ddl(ddl_tag: &str) -> bool {
             | "CREATE INDEX"
             | "DROP INDEX"
             | "RENAME TABLE"
-            | "COMMENT"
             | "CREATE SEQUENCE"
             | "ALTER SEQUENCE"
             | "DROP SEQUENCE"
@@ -337,6 +401,46 @@ fn should_skip_ddl(ddl_tag: &str) -> bool {
             | "CREATE RULE"
             | "DROP RULE"
     )
+}
+
+/// Parsed target of a COMMENT ON statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommentTarget {
+    Table { comment: Option<String> },
+    Column { column_name: String, comment: Option<String> },
+    Other,
+}
+
+/// Parse a COMMENT ON SQL statement into a structured target.
+pub fn parse_comment_sql(sql: &str) -> CommentTarget {
+    let dialect = PostgreSqlDialect {};
+    let stmts = match Parser::parse_sql(&dialect, sql) {
+        Ok(s) => s,
+        Err(_) => return CommentTarget::Other,
+    };
+
+    for stmt in stmts {
+        if let Statement::Comment { object_type, object_name, comment, .. } = stmt {
+            match object_type {
+                CommentObject::Table => {
+                    return CommentTarget::Table { comment };
+                }
+                CommentObject::Column => {
+                    // object_name is e.g. public.users.email — last part is column name
+                    let column_name = object_name
+                        .0
+                        .last()
+                        .and_then(|part| part.as_ident())
+                        .map(|ident| ident.value.clone())
+                        .unwrap_or_default();
+                    return CommentTarget::Column { column_name, comment };
+                }
+                _ => return CommentTarget::Other,
+            }
+        }
+    }
+
+    CommentTarget::Other
 }
 
 /// Parse ALTER TABLE SQL to extract structured column changes using sqlparser.

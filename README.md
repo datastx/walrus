@@ -232,6 +232,10 @@ On each poll iteration, the Iceberg Writer processes DDL events per-table and ol
 1. **Apply pending DDL events** — for each table with pending events, claim the oldest event, attempt the schema change, and transition to applied or failed. Events are processed one at a time per table to maintain ordering.
 2. **Claim next file batch** — the file eligibility check includes the DDL gate. Tables with unresolved DDL events simply produce no eligible CDC files, so no additional coordination is needed.
 
+### Comment Propagation
+
+PostgreSQL table and column comments (`COMMENT ON TABLE/COLUMN`) are propagated to Iceberg tables. During initial backfill, table comments are set as the `comment` table property and column comments are set as `doc` fields on the Iceberg schema. When a `COMMENT ON TABLE` statement is issued on an already-replicated table, the Iceberg table property is updated in real time via a transaction. Column comment updates on existing tables are captured and logged but deferred until the next table recreation, due to an iceberg-rust limitation that prevents committing schema changes.
+
 ### DDL During Backfill
 
 DDL events that arrive while a table is still backfilling are queued as pending in the metadata store. They do not block backfill file processing because backfill data predates the DDL. When the table transitions to streaming, the writer processes the queued DDL events before any CDC files become eligible. This happens naturally because the DDL gate applies only to CDC files, and the writer processes pending DDL events on every poll iteration.
