@@ -195,14 +195,45 @@ impl<'a> CdcState<'a> {
         }
     }
 
-    fn handle_relation(
+    /// Handle a Relation message (schema update for a table).
+    ///
+    /// If a schema change arrives (e.g., ALTER TABLE ADD COLUMN) while records
+    /// with the old schema are still buffered, we must flush the old records
+    /// first. Otherwise, `write_cdc_records_to_parquet` would use the new
+    /// relation schema to serialize old records, causing column misalignment.
+    async fn handle_relation(
         &mut self,
         oid: u32,
         schema: String,
         name: String,
         columns: Vec<RelationColumn>,
-    ) {
+    ) -> anyhow::Result<()> {
+        // Check if the relation already exists with a different column count/layout
+        if let Some(existing) = self.relation_cache.get(oid) {
+            let schema_changed = existing.columns.len() != columns.len()
+                || existing
+                    .columns
+                    .iter()
+                    .zip(columns.iter())
+                    .any(|(a, b)| a.name != b.name || a.type_oid != b.type_oid);
+
+            if schema_changed {
+                let key = format!("{}.{}", existing.schema, existing.name);
+                if let Some(buf) = self.table_buffers.get(&key) {
+                    if !buf.is_empty() {
+                        tracing::info!(
+                            table = %key,
+                            old_cols = existing.columns.len(),
+                            new_cols = columns.len(),
+                            "Schema change detected — flushing buffered records with old schema"
+                        );
+                        self.flush().await?;
+                    }
+                }
+            }
+        }
         self.relation_cache.update(oid, schema, name, columns);
+        Ok(())
     }
 
     async fn handle_insert(&mut self, relation_oid: u32, tuple: &TupleData) -> anyhow::Result<()> {
@@ -229,11 +260,27 @@ impl<'a> CdcState<'a> {
         self.push_txn_record(record)
     }
 
-    fn handle_update(&mut self, relation_oid: u32, new_tuple: &TupleData) -> anyhow::Result<()> {
+    fn handle_update(
+        &mut self,
+        relation_oid: u32,
+        old_tuple: Option<&TupleData>,
+        new_tuple: &TupleData,
+    ) -> anyhow::Result<()> {
         let Some(rel) = self.relation_cache.get(relation_oid) else {
             return Ok(());
         };
-        let record = tuple_to_cdc_record(rel, CdcOp::Update, new_tuple, Lsn::ZERO, 0);
+        let rel = rel.clone();
+
+        // When REPLICA IDENTITY FULL is set and the old tuple is provided,
+        // emit a Delete for the old PK values before the Update. This handles
+        // PK changes correctly: the equality delete targets the old PK, and
+        // the upsert writes the new PK.
+        if let Some(old) = old_tuple {
+            let old_record = tuple_to_cdc_record(&rel, CdcOp::Delete, old, Lsn::ZERO, 0);
+            self.push_txn_record(old_record)?;
+        }
+
+        let record = tuple_to_cdc_record(&rel, CdcOp::Update, new_tuple, Lsn::ZERO, 0);
         self.push_txn_record(record)
     }
 
@@ -241,6 +288,16 @@ impl<'a> CdcState<'a> {
         let Some(rel) = self.relation_cache.get(relation_oid) else {
             return Ok(());
         };
+        // With REPLICA IDENTITY NOTHING, DELETE messages have no old tuple values,
+        // producing all-NULL columns. The resulting equality delete matches nothing.
+        if old_tuple.columns.iter().all(|c| matches!(c, TupleColumn::Null)) {
+            tracing::warn!(
+                table = %rel.name,
+                "DELETE with all-NULL columns — likely REPLICA IDENTITY NOTHING. \
+                 Deletes will not be replicated. Set REPLICA IDENTITY DEFAULT or FULL."
+            );
+            metrics::counter!("walrus_cdc_null_delete_total", "table" => rel.name.clone()).increment(1);
+        }
         let record = tuple_to_cdc_record(rel, CdcOp::Delete, old_tuple, Lsn::ZERO, 0);
         self.push_txn_record(record)
     }
@@ -536,7 +593,7 @@ pub async fn run_cdc_loop(
                         name,
                         columns,
                         ..
-                    } => state.handle_relation(oid, schema, name, columns),
+                    } => state.handle_relation(oid, schema, name, columns).await?,
                     PgOutputMessage::Insert {
                         relation_oid,
                         tuple,
@@ -546,10 +603,10 @@ pub async fn run_cdc_loop(
                     }
                     PgOutputMessage::Update {
                         relation_oid,
+                        old_tuple,
                         new_tuple,
-                        ..
                     } => {
-                        state.handle_update(relation_oid, &new_tuple)?;
+                        state.handle_update(relation_oid, old_tuple.as_ref(), &new_tuple)?;
                         metrics::counter!("walrus_cdc_rows_total", "op" => "update").increment(1);
                     }
                     PgOutputMessage::Delete {
@@ -581,6 +638,20 @@ pub async fn run_cdc_loop(
                     }
                     PgOutputMessage::StreamAbort { xid, .. } => {
                         state.handle_stream_abort(xid);
+                    }
+                    PgOutputMessage::Truncate { relation_oids } => {
+                        for oid in &relation_oids {
+                            let table_name = state.relation_cache.get(*oid)
+                                .map(|r| format!("{}.{}", r.schema, r.name))
+                                .unwrap_or_else(|| format!("oid:{}", oid));
+                            tracing::error!(
+                                table = %table_name,
+                                "TRUNCATE detected but not replicated to Iceberg — \
+                                 the Iceberg table will retain pre-truncate data. \
+                                 Run a manual resync to correct."
+                            );
+                        }
+                        metrics::counter!("walrus_cdc_truncate_ignored_total").increment(1);
                     }
                     _ => {}
                 }
@@ -694,7 +765,15 @@ fn tuple_to_cdc_record(
                     estimated_bytes += data.len();
                     Some(data.clone())
                 }
-                TupleColumn::Null | TupleColumn::UnchangedToast => None,
+                TupleColumn::UnchangedToast => {
+                    // TOAST columns not sent by PG when unchanged (REPLICA IDENTITY DEFAULT).
+                    // This produces NULL in the CDC record, which can silently overwrite
+                    // the correct value during dedup. Operators should set
+                    // REPLICA IDENTITY FULL on tables with large columns.
+                    metrics::counter!("walrus_cdc_unchanged_toast_total", "table" => rel.name.clone()).increment(1);
+                    None
+                }
+                TupleColumn::Null => None,
             };
             CdcColumn {
                 name: rel_col.name.clone(),

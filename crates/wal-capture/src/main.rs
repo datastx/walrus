@@ -59,7 +59,21 @@ async fn main() -> anyhow::Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("failed to install SIGTERM handler");
+            tokio::select! {
+                _ = ctrl_c => {},
+                _ = sigterm.recv() => {},
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.ok();
+        }
         info!("SIGTERM/SIGINT received — shutting down");
         let _ = shutdown_tx.send(true);
     });
@@ -253,6 +267,27 @@ async fn cleanup_orphan_files(
             one_hour_ago,
             &mut orphans_removed,
         )?;
+    }
+
+    // Clean up orphaned spill files from crashed transactions.
+    // SpillFile's Drop normally cleans up, but if the process was killed,
+    // temp files in {staging_root}/spill/ accumulate indefinitely.
+    let spill_dir = staging_root.join("spill");
+    if spill_dir.exists() {
+        if let Ok(entries) = std::fs::read_dir(&spill_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("tmp") {
+                    let modified = std::fs::metadata(&path)
+                        .ok()
+                        .and_then(|m| m.modified().ok());
+                    if matches!(modified, Some(t) if t < one_hour_ago) {
+                        std::fs::remove_file(&path).ok();
+                        orphans_removed += 1;
+                    }
+                }
+            }
+        }
     }
 
     if orphans_removed > 0 {

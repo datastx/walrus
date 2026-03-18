@@ -1,6 +1,6 @@
 use arrow::record_batch::RecordBatch;
 use arrow_array::*;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use std::fs::File;
@@ -82,7 +82,8 @@ fn build_array_from_cdc_columns(
         .map(|r| r.columns.get(col_idx).and_then(|c| c.value.as_deref()))
         .collect();
 
-    match pg_type_oid_to_arrow(type_oid) {
+    let arrow_type = pg_type_oid_to_arrow(type_oid);
+    match arrow_type {
         DataType::Boolean => {
             let parsed: Vec<Option<bool>> = values
                 .iter()
@@ -92,6 +93,16 @@ fn build_array_from_cdc_columns(
                 })
                 .collect();
             Ok(Arc::new(BooleanArray::from(parsed)))
+        }
+        DataType::Int16 => {
+            let parsed: Vec<Option<i16>> = values
+                .iter()
+                .map(|v| {
+                    v.and_then(|b| std::str::from_utf8(b).ok())
+                        .and_then(|s| s.parse().ok())
+                })
+                .collect();
+            Ok(Arc::new(Int16Array::from(parsed)))
         }
         DataType::Int32 => {
             let parsed: Vec<Option<i32>> = values
@@ -113,6 +124,16 @@ fn build_array_from_cdc_columns(
                 .collect();
             Ok(Arc::new(Int64Array::from(parsed)))
         }
+        DataType::Float32 => {
+            let parsed: Vec<Option<f32>> = values
+                .iter()
+                .map(|v| {
+                    v.and_then(|b| std::str::from_utf8(b).ok())
+                        .and_then(|s| s.parse().ok())
+                })
+                .collect();
+            Ok(Arc::new(Float32Array::from(parsed)))
+        }
         DataType::Float64 => {
             let parsed: Vec<Option<f64>> = values
                 .iter()
@@ -123,8 +144,54 @@ fn build_array_from_cdc_columns(
                 .collect();
             Ok(Arc::new(Float64Array::from(parsed)))
         }
+        DataType::Date32 => {
+            // pgoutput sends dates as text like "2024-01-15".
+            // Parse to NaiveDate, then convert to days since Unix epoch.
+            let parsed: Vec<Option<i32>> = values
+                .iter()
+                .map(|v| {
+                    v.and_then(|b| std::str::from_utf8(b).ok())
+                        .and_then(|s| {
+                            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                                .ok()
+                                .map(|d| {
+                                    (d - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap())
+                                        .num_days() as i32
+                                })
+                        })
+                })
+                .collect();
+            Ok(Arc::new(Date32Array::from(parsed)))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            // pgoutput sends timestamps as text like "2024-01-15 10:30:00.123456".
+            // Parse and convert to microseconds since Unix epoch.
+            let parsed: Vec<Option<i64>> = values
+                .iter()
+                .map(|v| {
+                    v.and_then(|b| std::str::from_utf8(b).ok())
+                        .and_then(|s| {
+                            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+                                .ok()
+                                .or_else(|| {
+                                    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
+                                })
+                                .map(|dt| dt.and_utc().timestamp_micros())
+                        })
+                })
+                .collect();
+            if tz.is_some() {
+                Ok(Arc::new(
+                    TimestampMicrosecondArray::from(parsed).with_timezone("UTC"),
+                ))
+            } else {
+                Ok(Arc::new(
+                    TimestampMicrosecondArray::from(parsed).with_timezone_opt(None::<String>),
+                ))
+            }
+        }
         _ => {
-            // Default: treat as string
+            // Default: treat as string (json, jsonb, uuid, inet, arrays, etc.)
             let strings: Vec<Option<&str>> = values
                 .iter()
                 .map(|v| v.and_then(|b| std::str::from_utf8(b).ok()))

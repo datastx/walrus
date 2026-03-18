@@ -326,17 +326,19 @@ fn parse_binary_column(
         }
         1082 => {
             // date: i32 days since PG epoch (2000-01-01) → Unix epoch days
+            // Use saturating_add to handle PG's infinity/−infinity (i32::MAX/MIN).
             let v: Vec<Option<i32>> = values
                 .iter()
-                .map(|v| v.map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]) + PG_EPOCH_DAYS))
+                .map(|v| v.map(|b| i32::from_be_bytes([b[0], b[1], b[2], b[3]]).saturating_add(PG_EPOCH_DAYS)))
                 .collect();
             Ok(Arc::new(Date32Array::from(v)))
         }
         1114 => {
             // timestamp: i64 µs since PG epoch → Unix epoch
+            // Use saturating_add to handle PG's infinity/−infinity (i64::MAX/MIN).
             let v: Vec<Option<i64>> = values
                 .iter()
-                .map(|v| v.map(|b| i64::from_be_bytes(b[..8].try_into().unwrap()) + PG_EPOCH_USEC))
+                .map(|v| v.map(|b| i64::from_be_bytes(b[..8].try_into().unwrap()).saturating_add(PG_EPOCH_USEC)))
                 .collect();
             Ok(Arc::new(
                 TimestampMicrosecondArray::from(v).with_timezone_opt(None::<String>),
@@ -344,9 +346,10 @@ fn parse_binary_column(
         }
         1184 => {
             // timestamptz: i64 µs since PG epoch → Unix epoch (UTC)
+            // Use saturating_add to handle PG's infinity/−infinity (i64::MAX/MIN).
             let v: Vec<Option<i64>> = values
                 .iter()
-                .map(|v| v.map(|b| i64::from_be_bytes(b[..8].try_into().unwrap()) + PG_EPOCH_USEC))
+                .map(|v| v.map(|b| i64::from_be_bytes(b[..8].try_into().unwrap()).saturating_add(PG_EPOCH_USEC)))
                 .collect();
             Ok(Arc::new(
                 TimestampMicrosecondArray::from(v).with_timezone("UTC"),

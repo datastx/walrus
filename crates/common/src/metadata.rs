@@ -475,9 +475,13 @@ impl MetadataStore {
             ],
         )
         .await?;
+        // Use GREATEST to prevent LSN regression when multi-table flushes
+        // happen in arbitrary order (HashMap iteration). Without this, a crash
+        // between flushing table A (high LSN) and table B (low LSN) could
+        // permanently skip table B's data on restart.
         txn.execute(
             "UPDATE _pgiceberg.replication_state \
-             SET last_flushed_lsn = $2::text::pg_lsn, updated_at = now() \
+             SET last_flushed_lsn = GREATEST(last_flushed_lsn, $2::text::pg_lsn), updated_at = now() \
              WHERE slot_name = $1",
             &[&params.slot_name, &lsn_high_str],
         )
@@ -597,8 +601,17 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// On startup recovery: reclaim files stuck in 'processing' for > 10 min.
+    /// On startup recovery: reclaim files stuck in 'processing' for > threshold.
+    /// Default: 30 minutes. A large DuckDB merge of millions of rows can legitimately
+    /// take longer than 10 minutes, so we use a conservative threshold.
     pub async fn reclaim_stale_processing(&self) -> anyhow::Result<u64> {
+        self.reclaim_stale_processing_with_threshold(30).await
+    }
+
+    pub async fn reclaim_stale_processing_with_threshold(
+        &self,
+        threshold_minutes: i32,
+    ) -> anyhow::Result<u64> {
         let client = self.pool.get().await?;
         let count = client
             .execute(
@@ -606,8 +619,8 @@ impl MetadataStore {
                  SET status = 'pending', retry_count = retry_count + 1, \
                      processing_started = NULL \
                  WHERE status = 'processing' \
-                   AND processing_started < now() - interval '10 minutes'",
-                &[],
+                   AND processing_started < now() - make_interval(mins => $1::float8)",
+                &[&(threshold_minutes as f64)],
             )
             .await?;
         Ok(count)

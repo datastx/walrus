@@ -109,15 +109,21 @@ impl DuckDbEngine {
 
     // ── Resync operations ──────────────────────────────────────────
 
-    /// Load existing Iceberg data files and new backfill files into separate tables.
+    /// Load existing Iceberg data files (with equality deletes applied) and new
+    /// backfill files into separate DuckDB tables.
     ///
-    /// Creates `old_data` (existing Iceberg rows) and `new_data` (fresh backfill rows).
-    pub fn load_resync_data(
+    /// Creates `old_data` (existing Iceberg rows after applying deletes) and
+    /// `new_data` (fresh backfill rows). Without applying delete files, rows
+    /// that were "deleted" via equality deletes would still appear in old_data,
+    /// causing incorrect diff results.
+    pub fn load_resync_data_with_deletes(
         &self,
-        old_files: &[String],
+        old_data_files: &[String],
+        old_delete_files: &[String],
         new_files: &[String],
+        pk_columns: &[String],
     ) -> anyhow::Result<()> {
-        let old_list = old_files
+        let old_list = old_data_files
             .iter()
             .map(|p| format!("'{}'", p.replace('\'', "''")))
             .collect::<Vec<_>>()
@@ -128,12 +134,55 @@ impl DuckDbEngine {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let sql = format!(
-            "CREATE OR REPLACE TABLE old_data AS SELECT * FROM read_parquet([{}])",
-            old_list
-        );
-        debug!(sql = %sql, "Loading existing Iceberg data into DuckDB");
-        self.conn.execute_batch(&sql)?;
+        if old_delete_files.is_empty() || pk_columns.is_empty() {
+            // No delete files to apply — load data files directly
+            let sql = format!(
+                "CREATE OR REPLACE TABLE old_data AS SELECT * FROM read_parquet([{}])",
+                old_list
+            );
+            debug!(sql = %sql, "Loading existing Iceberg data into DuckDB");
+            self.conn.execute_batch(&sql)?;
+        } else {
+            // Load data files, then anti-join against delete files to get true state
+            let delete_list = old_delete_files
+                .iter()
+                .map(|p| format!("'{}'", p.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            let sql = format!(
+                "CREATE OR REPLACE TABLE _raw_old_data AS SELECT * FROM read_parquet([{}])",
+                old_list
+            );
+            self.conn.execute_batch(&sql)?;
+
+            let sql = format!(
+                "CREATE OR REPLACE TABLE _delete_keys AS SELECT * FROM read_parquet([{}])",
+                delete_list
+            );
+            self.conn.execute_batch(&sql)?;
+
+            let join_cond = pk_columns
+                .iter()
+                .map(|c| format!("d.\"{}\" = dk.\"{}\"", c, c))
+                .collect::<Vec<_>>()
+                .join(" AND ");
+
+            let sql = format!(
+                "CREATE OR REPLACE TABLE old_data AS \
+                 SELECT d.* FROM _raw_old_data d \
+                 LEFT JOIN _delete_keys dk ON {} \
+                 WHERE dk.\"{}\" IS NULL",
+                join_cond, pk_columns[0]
+            );
+            debug!(
+                delete_files = old_delete_files.len(),
+                "Applying equality deletes to old data for resync diff"
+            );
+            self.conn.execute_batch(&sql)?;
+            self.conn
+                .execute_batch("DROP TABLE IF EXISTS _raw_old_data; DROP TABLE IF EXISTS _delete_keys;")?;
+        }
 
         let sql = format!(
             "CREATE OR REPLACE TABLE new_data AS SELECT * FROM read_parquet([{}])",
